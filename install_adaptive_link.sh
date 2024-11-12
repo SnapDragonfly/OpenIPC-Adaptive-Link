@@ -7,11 +7,23 @@ echo_blue()  { printf "\033[1;34m$*\033[m\n"; }
 UDP_IP=10.5.0.10
 UDP_PORT=9999
 LOG_INTERVAL=200
+
 WFBGS_CFG=/etc/wifibroadcast.cfg
-URL_ALINK_GS=https://raw.githubusercontent.com/sickgreg/OpenIPC-Adaptive-Link/refs/heads/main/alink_gs
-URL_ALINK_DRONE=https://github.com/sickgreg/OpenIPC-Adaptive-Link/raw/refs/heads/main/alink_drone
-URL_TXPROFILE_CONF=https://raw.githubusercontent.com/sickgreg/OpenIPC-Adaptive-Link/refs/heads/main/txprofiles.conf
-URL_ALINK_CONF=https://raw.githubusercontent.com/sickgreg/OpenIPC-Adaptive-Link/refs/heads/main/alink.conf
+
+# Base URL for downloading files
+BASE_URL="https://raw.githubusercontent.com/sickgreg/OpenIPC-Adaptive-Link/refs/heads/main"
+
+# File names
+GS_NAME="alink_gs"
+DRONE_NAME="alink_drone"
+TXPROFILE_NAME="txprofiles.conf"
+CONF_NAME="alink.conf"
+
+# Complete URLs for each file
+URL_ALINK_GS="${BASE_URL}/${GS_NAME}"
+URL_ALINK_DRONE="${BASE_URL}/${DRONE_NAME}"
+URL_ALINK_TXPROFILE="${BASE_URL}/${TXPROFILE_NAME}"
+URL_ALINK_CONF="${BASE_URL}/${CONF_NAME}"
 
 
 if [ $(id -u) -ne "0" ]; then
@@ -42,11 +54,16 @@ if [ "$1" = "gs" ]; then
 			exit 1
 		fi
 
+		if [ "$3" = "src" ]; then
+			cp $GS_NAME $FILE
+			
+		else
+			wget $URL_ALINK_GS -O $FILE
+		fi
+
+		chmod +x $FILE
 		
-        wget $URL_ALINK_GS -O $FILE
-        chmod +x $FILE
-		
-        cat <<EOF | tee $PATH_SERVICE
+		cat <<EOF | tee $PATH_SERVICE
 [Unit]
 Description=OpenIPC_AdaptiveLink
 
@@ -71,9 +88,9 @@ EOF
 		
 		sed -i 's/udp_ip.*/udp_ip = '$UDP_IP'/' $FILE_CONF
 		sed -i 's/udp_port.*/udp_port = '$UDP_PORT'/' $FILE_CONF
-        
-        
-        isLogInterval=$(grep -o "log_interval" ${WFBGS_CFG})
+
+
+		isLogInterval=$(grep -o "log_interval" ${WFBGS_CFG})
 		if [ -z $isLogInterval ]; then
 			echo "$(sed '/\[common\]/a log_interval = '${LOG_INTERVAL}'' $WFBGS_CFG)" > $WFBGS_CFG
 		else
@@ -107,7 +124,11 @@ EOF
 		systemctl stop $FILE_NAME.service && echo "Wait..." && sleep 3
 		systemctl status $FILE_NAME.service
 		
-		wget $URL_ALINK_GS -O $FILE
+		if [ "$3" = "src" ]; then
+			cp $GS_NAME $FILE
+		else
+			wget $URL_ALINK_GS -O $FILE
+		fi
 		
 		isLogInterval=$(grep -o "log_interval" ${WFBGS_CFG})
 		if [ -z $isLogInterval ]; then
@@ -145,10 +166,16 @@ elif [ "$1" = "drone" ]; then
 			echo_red "$FILE_NAME is already installed. First, delete the program: '$0 drone remove'"
 			exit 1
 		fi
-		
-		curl -L -o $FILE $URL_ALINK_DRONE
-		curl -L -o $TXPROFILE $URL_TXPROFILE_CONF
-		curl -L -o $ALINK $URL_ALINK_CONF
+
+		if [ "$3" = "src" ]; then
+			cp $DRONE_NAME $FILE
+			cp $TXPROFILE_NAME $TXPROFILE
+			cp $CONF_NAME $ALINK
+		else
+			curl -L -o $FILE $URL_ALINK_DRONE
+			curl -L -o $TXPROFILE $URL_TXPROFILE_CONF
+			curl -L -o $ALINK $URL_ALINK_CONF
+		fi
 
 		chmod +x $FILE
 		
@@ -188,11 +215,17 @@ elif [ "$1" = "drone" ]; then
 		
 		echo "killall $FILE_NAME"
 		killall $FILE_NAME && echo "Wait..." && sleep 1
-		
-		curl -L -o $FILE $URL_ALINK_DRONE
-		curl -L -o $TXPROFILE $URL_TXPROFILE_CONF
-		curl -L -o $ALINK $URL_ALINK_CONF
-		
+
+		if [ "$3" = "src" ]; then
+			cp $DRONE_NAME $FILE
+			cp $TXPROFILE_NAME $TXPROFILE
+			cp $CONF_NAME $ALINK
+		else
+			curl -L -o $FILE $URL_ALINK_DRONE
+			curl -L -o $TXPROFILE $URL_TXPROFILE_CONF
+			curl -L -o $ALINK $URL_ALINK_CONF
+		fi
+
 		echo_green "The update is complete. Restart the system"
 	fi
 	
@@ -201,8 +234,8 @@ fi
 
 
 cat <<EOF
-Usage: $0 gs install|remove|update
-       $0 drone install|remove|update
+Usage: $0 gs install [src]|remove|update
+       $0 drone install [src]|remove|update
 EOF
 
 
