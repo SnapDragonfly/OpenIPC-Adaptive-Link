@@ -1,5 +1,19 @@
 #!/bin/bash
 
+
+help() {
+    cat <<EOF
+Usage: $0 gs install|remove|update [src]
+       $0 drone install|remove|update [goke|hisi|star6b0|star6e]
+EOF
+}
+
+# Example usage of the help function
+if [ "$1" = "--help" ]; then
+    help
+    exit 0
+fi
+
 echo_red()   { printf "\033[1;31m$*\033[m\n"; }
 echo_green() { printf "\033[1;32m$*\033[m\n"; }
 echo_blue()  { printf "\033[1;34m$*\033[m\n"; }
@@ -24,8 +38,8 @@ CONFIG_PATH="config"
 
 # File names
 GS_NAME="alink_gs.py"
-TXPROFILE_NAME="$(CONFIG_PATH)/txprofiles.conf"
-CONF_NAME="$(CONFIG_PATH)/alink.conf"
+TXPROFILE_NAME="${CONFIG_PATH}/txprofiles.conf"
+CONF_NAME="${CONFIG_PATH}/alink.conf"
 
 # Complete URLs for each file
 URL_ALINK_GS="${BASE_URL}/${GS_NAME}"
@@ -38,6 +52,7 @@ isSystem=$(grep -o "NAME=Buildroot" /etc/os-release)
 if [ "$1" = "gs" ]; then
 	if [ ! -z $isSystem ]; then
 		echo_red "Error: It doesn't look like it's an SBC"
+		help
 		exit 1
 	fi
 
@@ -51,6 +66,7 @@ if [ "$1" = "gs" ]; then
 		
 		if [ -f $FILE ];then
 			echo_red   "$FILE_NAME is already installed. First, delete the program: '$0 gs remove'"
+			help
 			exit 1
 		fi
 
@@ -83,6 +99,7 @@ EOF
 		
 		if [ ! -f $FILE_CONF ]; then	
 			echo_red "Error: File ${FILE_CONF} not found" 
+			help
 			exit 1
 		fi
 		
@@ -118,6 +135,7 @@ EOF
 		
 		if [ ! -f $FILE ];then
 			echo_red   "$FILE_NAME not installed. To install, use: '$0 gs install'"
+			help
 			exit 1
 		fi
 		
@@ -143,13 +161,16 @@ EOF
 		systemctl status $FILE_NAME.service
 		
 		echo_green "The update is complete"
-	
+	else
+		help
+		exit 1
 	fi
-	exit 0
 
+	exit 0
 elif [ "$1" = "drone" ]; then
 	if [ -z $isSystem ]; then
 		echo_red "Error: It doesn't look like it's an Drone"
+		help
 		exit 1
 	fi
 
@@ -169,12 +190,13 @@ elif [ "$1" = "drone" ]; then
 			;;
 		*)
 			echo_red "Error: $2 not supported!"
+			help
 			exit 1  # Exit if none of the conditions are met
 			;;
 	esac
 
 	RELEASE_PATH="release/$3"
-	DRONE_NAME="$(RELEASE_PATH)/ALink42n"
+	DRONE_NAME="${RELEASE_PATH}/ALink42n"
 	URL_ALINK_DRONE="${BASE_URL}/${DRONE_NAME}"
 	
 	TXPROFILE=/etc/txprofiles.conf
@@ -187,6 +209,7 @@ elif [ "$1" = "drone" ]; then
 		
 		if [ -f $FILE ];then
 			echo_red "$FILE_NAME is already installed. First, delete the program: '$0 drone remove'"
+			help
 			exit 1
 		fi
 
@@ -233,6 +256,7 @@ elif [ "$1" = "drone" ]; then
 		
 		if [ ! -f $FILE ];then
 			echo_red   "$FILE_NAME not installed. To install, use: '$0 drone install'"
+			help
 			exit 1
 		fi
 
@@ -250,16 +274,13 @@ elif [ "$1" = "drone" ]; then
 		fi
 
 		echo_green "The update is complete. Restart the system"
+	else
+		help
+		exit 1
 	fi
-	
+
 	exit 0
 fi
 
-
-cat <<EOF
-Usage: $0 gs install|remove|update
-       $0 drone install|remove|update [goke|hisi|star6b0|star6e]
-EOF
-
-
+help
 exit 0
