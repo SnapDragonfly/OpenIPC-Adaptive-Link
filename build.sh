@@ -14,7 +14,7 @@ elif [[ "$1" == *"hisi" ]]; then
 	CC=cortex_a7_thumb2-gcc13-musl-4_9
 	GCC=$PWD/toolchain/$CC/bin/arm-linux-gcc
 else
-	echo "Usage: $0 [goke|hisi|star6b0|star6e|]"
+	echo "Usage: $0 [goke|hisi|star6b0|star6e]"
 	exit 1
 fi
 

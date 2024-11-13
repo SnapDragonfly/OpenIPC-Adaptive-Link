@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 echo_red()   { printf "\033[1;31m$*\033[m\n"; }
 echo_green() { printf "\033[1;32m$*\033[m\n"; }
@@ -10,27 +10,27 @@ LOG_INTERVAL=200
 
 WFBGS_CFG=/etc/wifibroadcast.cfg
 
-# Base URL for downloading files
-BASE_URL="https://raw.githubusercontent.com/sickgreg/OpenIPC-Adaptive-Link/refs/heads/main"
-
-# File names
-GS_NAME="alink_gs"
-DRONE_NAME="alink_drone"
-TXPROFILE_NAME="txprofiles.conf"
-CONF_NAME="alink.conf"
-
-# Complete URLs for each file
-URL_ALINK_GS="${BASE_URL}/${GS_NAME}"
-URL_ALINK_DRONE="${BASE_URL}/${DRONE_NAME}"
-URL_ALINK_TXPROFILE="${BASE_URL}/${TXPROFILE_NAME}"
-URL_ALINK_CONF="${BASE_URL}/${CONF_NAME}"
-
-
 if [ $(id -u) -ne "0" ]; then
 	echo "Permission denied"
 	echo "sudo $0 $1 $2"
 	exit 1
 fi
+
+# Base URL for downloading files
+#BASE_URL="https://raw.githubusercontent.com/sickgreg/OpenIPC-Adaptive-Link/refs/heads/main"
+BASE_URL="https://github.com/SnapDragonfly/OpenIPC-Adaptive-Link/tree/porting_jetson_orin"
+CONFIG_PATH="config"
+
+
+# File names
+GS_NAME="alink_gs.py"
+TXPROFILE_NAME="$(CONFIG_PATH)/txprofiles.conf"
+CONF_NAME="$(CONFIG_PATH)/alink.conf"
+
+# Complete URLs for each file
+URL_ALINK_GS="${BASE_URL}/${GS_NAME}"
+URL_ALINK_TXPROFILE="${BASE_URL}/${TXPROFILE_NAME}"
+URL_ALINK_CONF="${BASE_URL}/${CONF_NAME}"
 
 # drone or gs
 isSystem=$(grep -o "NAME=Buildroot" /etc/os-release)
@@ -54,7 +54,7 @@ if [ "$1" = "gs" ]; then
 			exit 1
 		fi
 
-		if [ "$3" = "src" ]; then
+		if [ -n "$3" ]; then
 			cp $GS_NAME $FILE
 			
 		else
@@ -153,6 +153,29 @@ elif [ "$1" = "drone" ]; then
 		exit 1
 	fi
 
+	# Check for specific values in the third argument ($3)
+	case "$3" in
+		*star6b0*)
+			echo "star6b0 adaptive link ... ..."
+			;;
+		*star6e*)
+			echo "star6e adaptive link ... ..."
+			;;
+		*goke*)
+			echo "goke adaptive link ... ..."
+			;;
+		*hisi*)
+			echo "hisi adaptive link ... ..."
+			;;
+		*)
+			echo_red "Error: $2 not supported!"
+			exit 1  # Exit if none of the conditions are met
+			;;
+	esac
+
+	RELEASE_PATH="release/$3"
+	DRONE_NAME="$(RELEASE_PATH)/ALink42n"
+	URL_ALINK_DRONE="${BASE_URL}/${DRONE_NAME}"
 	
 	TXPROFILE=/etc/txprofiles.conf
 	ALINK=/etc/alink.conf
@@ -167,7 +190,7 @@ elif [ "$1" = "drone" ]; then
 			exit 1
 		fi
 
-		if [ "$3" = "src" ]; then
+		if [ -n "$3" ]; then
 			cp $DRONE_NAME $FILE
 			cp $TXPROFILE_NAME $TXPROFILE
 			cp $CONF_NAME $ALINK
@@ -212,11 +235,11 @@ elif [ "$1" = "drone" ]; then
 			echo_red   "$FILE_NAME not installed. To install, use: '$0 drone install'"
 			exit 1
 		fi
-		
+
 		echo "killall $FILE_NAME"
 		killall $FILE_NAME && echo "Wait..." && sleep 1
 
-		if [ "$3" = "src" ]; then
+		if [ -n "$3" ]; then
 			cp $DRONE_NAME $FILE
 			cp $TXPROFILE_NAME $TXPROFILE
 			cp $CONF_NAME $ALINK
@@ -234,8 +257,8 @@ fi
 
 
 cat <<EOF
-Usage: $0 gs install [src]|remove|update
-       $0 drone install [src]|remove|update
+Usage: $0 gs install|remove|update
+       $0 drone install|remove|update [goke|hisi|star6b0|star6e]
 EOF
 
 
