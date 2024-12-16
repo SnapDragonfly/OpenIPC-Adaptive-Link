@@ -3,8 +3,8 @@
 
 help() {
     cat <<EOF
-Usage: $0 gs install|remove|update [src]
-       $0 drone install|remove|update [goke|hisi|star6b0|star6e]
+Usage: $0 gs <install|remove|update> [src]
+       $0 drone <install|remove|update> <goke|hisi|star6b0|star6e> [src]
 EOF
 }
 
