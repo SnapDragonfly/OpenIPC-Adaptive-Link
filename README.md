@@ -88,10 +88,10 @@ Config files are `/etc/txprofiles.conf` and `/etc/alink.conf`
 
 3. PixelPilot Android... Still testing early pre-release.  Stay tuned.
 
-4. Auto-install on ground station
+4. Auto-install on Radxa ground station
 
 ```
-curl -L -o alink_install.sh https://raw.githubusercontent.com/sickgreg/OpenIPC-Adaptive-Link/refs/heads/main/alink_install.sh
+sudo curl -L -o alink_install.sh https://raw.githubusercontent.com/sickgreg/OpenIPC-Adaptive-Link/refs/heads/main/alink_install.sh
 sudo chmod +x alink_install.sh
 sudo ./alink_install.sh gs install
 ```
