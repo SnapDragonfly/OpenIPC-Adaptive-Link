@@ -81,18 +81,13 @@ update_log_interval() {
 gs_setup() {
 	FILE_NAME=alink_gs
 	FILE=/usr/local/bin/$FILE_NAME
-# Check if /config directory exists
-if [ -d "/config" ]; then
-  # If /config exists, use it
-  FILE_CONF="/config/$FILE_NAME.conf"
-# Check if /home/radxa directory exists
-elif [ -d "/home/radxa" ]; then
-  # If /home/radxa exists, use it
-  FILE_CONF="/home/radxa/$FILE_NAME.conf"
-else
-  # If neither /config nor /home/radxa exist, use /etc
-  FILE_CONF="/etc/$FILE_NAME.conf"
-fi
+	FILE_CONF="/etc/alink_gs.conf"
+
+	# If /config exists, create or update the symlink so /etc/alink_gs.conf points to /config/alink_gs.conf
+	if [ -d "/config" ]; then
+		ln -sf /config/alink_gs.conf $FILE_CONF
+	fi
+	
 	PATH_SERVICE=/etc/systemd/system/$FILE_NAME.service
 
 	case "$1" in
