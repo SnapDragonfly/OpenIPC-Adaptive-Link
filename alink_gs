@@ -1,430 +1,366 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
+import os
 import socket
-import msgpack
-import struct
-import threading
-import string
-import random
+import json
 import time
 import argparse
-import os
+import struct
+import random
+import string
+import threading
 import configparser
 
-VERSION = "0.1.1"
+# Defaults used to create new .conf when missing or incomplete
+DEFAULT_CONFIG = """# adaptive-link VRX settings
 
-# Global variables
-results = []
-link_health_score_rssi = 1000  # Default score before calculation for RSSI
-link_health_score_snr = 1000  # Default score before calculation for SNR
-recovered_packets = 0  # To store the number of recovered packets (FEC)
-lost_packets = 0  # To store the number of lost packets
-best_antennas_rssi = [-105, -105, -105, -105]  # Default values for best antennas RSSI if less than 4
-best_antennas_snr = [-105, -105, -105, -105]  # Default values for best antennas SNR if less than 4
-config = None  # Configuration file object
-udp_socket = None  # To store the UDP socket globally
-udp_ip = None  # To store the UDP IP globally
-udp_port = None  # To store the UDP port globally
-previous_link_health_score_rssi = None
-previous_link_health_score_snr = None
-# Counting fec_rec
-accumulator_period = 1.0
-recovered_packets_accumulator = 0
-last_accumulator_reset = time.time()
+[outgoing]
+udp_ip = 10.5.0.10
+udp_port = 9999
 
+[json]
+HOST = 127.0.0.1
+PORT = 8103
 
+[weights]
+snr_weight = 0.5
+rssi_weight = 0.5
 
-# Default config values
-DEFAULT_CONFIG = {
-    'Settings': {
-        'version': VERSION,  # Current version of the script
-        'message_interval': '100',  # Time between sending messages (milliseconds)
-        'use_best_rssi': 'True',  # Option to pick best available RSSI for link health score
-        'min_rssi': '-80',  # Min RSSI range for link health
-        'max_rssi': '-30',  # Max RSSI range for link health
-        'min_snr': '12',  # Min SNR range for link health
-        'max_snr': '38',  # Max SNR range for link health
-        'host': '127.0.0.1',  # Host address to connect to
-        'port': '8003',  # Port to connect to
-        'udp_ip': '10.5.0.10',  # UDP IP to send link health data
-        'udp_port': '9999',  # UDP port to send link health data
-        'retry_interval': '1',  # Time in seconds to wait before retrying TCP connection on failure
-    },
-    'Descriptions': {
-        'version': 'Version of the script',
-        'message_interval': 'Time between sending UDP messages in milliseconds',
-        'use_best_rssi': 'Use True to pick the best available RSSI for health score, or False for average RSSI',
-        'min_rssi': 'Minimum RSSI value used for link health calculation',
-        'max_rssi': 'Maximum RSSI value used for link health calculation',
-        'min_snr': 'Minimum SNR value used for link health calculation',
-        'max_snr': 'Maximum SNR value used for link health calculation',
-        'host': 'Host address to connect to for the TCP connection',
-        'port': 'Port to connect to for the TCP connection',
-        'udp_ip': 'UDP IP to send the link health data',
-        'udp_port': 'UDP port to send the link health data',
-        'retry_interval': 'Time in seconds to wait before retrying TCP connection on failure'
-    }
+[ranges]
+SNR_MIN = 12
+SNR_MAX = 38
+RSSI_MIN = -80
+RSSI_MAX = -30
+
+[keyframe]
+allow_idr = True
+idr_max_messages = 20
+
+[dynamic refinement]
+allow_penalty = True
+allow_fec_increase = True
+
+[noise]
+min_noise = 0.01
+max_noise = 0.1
+deduction_exponent = 0.5
+min_noise_for_fec_change = 0.01
+noise_for_max_fec_change = 0.1
+
+[error estimation]
+kalman_estimate = 0.005
+kalman_error_estimate = 0.1
+process_variance = 1e-5
+measurement_variance = 0.01
+"""
+
+# List of required sections in the config
+REQUIRED_SECTIONS = {
+    'outgoing', 'json', 'weights', 'ranges', 
+    'keyframe', 'dynamic refinement', 'noise', 'error estimation'
 }
 
-def update_recovered_packets_accumulator(new_recovered_packets):
-    global recovered_packets_accumulator
-    recovered_packets_accumulator += new_recovered_packets
-
-
-def load_config(config_file='config.ini'):
-    global config
-    config = configparser.ConfigParser()
-
-    # Check if config file exists, otherwise create it with default values
-    if not os.path.exists(config_file):
-        print(f"Config file {config_file} not found. Creating with default values...")
-        config.read_dict(DEFAULT_CONFIG)
-        with open(config_file, 'w') as f:
-            config.write(f)
-    else:
-        config.read(config_file)
-
-    # Ensure the version is updated in the config file
-    if config['Settings'].get('version') != VERSION:
-        print(f"Updating version in config file from {config['Settings'].get('version')} to {VERSION}")
-        config['Settings']['version'] = VERSION
-        update_version_history(config_file)
-
-    # Ensure config file is up to date (i.e., if a new field is added)
-    updated = False
-    for section in DEFAULT_CONFIG:
-        if section not in config:
-            config[section] = DEFAULT_CONFIG[section]
-            updated = True
-        else:
-            for key, value in DEFAULT_CONFIG[section].items():
-                if key not in config[section]:
-                    config[section][key] = value
-                    updated = True
-
-    if updated:
-        with open(config_file, 'w') as f:
-            config.write(f)
-
-def update_version_history(config_file):
-    """
-    Updates the version history in the configuration file.
-    """
-    if 'Version History' not in config:
-        config['Version History'] = {}
-
-    # Add the current version with a timestamp
-    timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
-    config['Version History'][VERSION] = f"Version {VERSION} updated on {timestamp}"
-
-    # Write the updated config to file
-    with open(config_file, 'w') as f:
-        config.write(f)
-
-def generate_random_code(length=4):
-    """
-    Generate a random string of letters of specified length
-    """
-    return ''.join(random.choices(string.ascii_lowercase, k=length))
-
-def request_keyframe():
-    """
-    Send a special message to request a keyframe with a unique code each time
-    """
-    num_attempts = 5  # Number of times to send the message
-
-    # Generate a random code for this request
-    unique_code = generate_random_code()
-
-    # Create the special message with the unique code
-    special_message = f"special:request_keyframe:{unique_code}"
-
-    for attempt in range(num_attempts):
-        send_udp(special_message)  # Call send_udp to send the special message
-        if verbose_mode:
-            print(f"Sent special message: {special_message}, attempt {attempt + 1}/{num_attempts}")
-        time.sleep(0.05)  # Wait before the next attempt
-    
-def drop_gop():
-    """
-    Send a special message to drop the gop
-    """
-    special_message = "special:drop_gop"
-    num_attempts = 5  # Number of times to send the message
-
-    for attempt in range(num_attempts):
-        send_udp(special_message)  # Call send_udp to send the special message
-        if verbose_mode:
-            print(f"Sent special message: {special_message}, attempt {attempt + 1}/{num_attempts}")
-        time.sleep(0.1)  # Wait before the next attempt
-
-
-def calculate_link_health(video_rx):
-    global recovered_packets, lost_packets, link_health_score_rssi, link_health_score_snr, best_antennas_rssi, best_antennas_snr
-    global previous_link_health_score_rssi, previous_link_health_score_snr
-
-
+# Function to create default config file
+def create_default_config(config_file):
+    # If the config file is a symlink, resolve it so that we write to its target.
+    target = os.path.realpath(config_file) if os.path.islink(config_file) else config_file
     try:
-        # Get configuration settings
-        message_interval = int(config['Settings']['message_interval'])
-        use_best_rssi = config.getboolean('Settings', 'use_best_rssi')
-        min_rssi = float(config['Settings']['min_rssi'])
-        max_rssi = float(config['Settings']['max_rssi'])
-        min_snr = float(config['Settings']['min_snr'])
-        max_snr = float(config['Settings']['max_snr'])
-
-        # Get packets data
-        packets = video_rx.get('packets', {})  # Access the 'packets' field
-
-        # Get FEC recovery stats from the 'packets' field
-        fec_rec = packets.get('fec_rec', [0, 0])
-        recovered_packets = fec_rec[0]  # Update the global recovered_packets
-        update_recovered_packets_accumulator(recovered_packets)
-       
-        # Get lost packet stats from the 'packets' field
-        lost = packets.get('lost', [0, 0])
-        lost_packets = lost[0]  # Update the global lost_packets
-        
-        # Check lost_packets and send special message if condition is met
-        if 0 < lost_packets < 10:
-        #if recovered_packets > 3:
-            request_keyframe()  # Send request_keyframe message
-            #drop_gop() # Send drop_gop message
-           
-        
-        # Get antenna stats
-        rx_ant_stats = video_rx.get('rx_ant_stats', {})
-        rssi_values = []
-        snr_values = []
-        num_antennas = len(rx_ant_stats)
-
-        # Ensure there are antenna stats available
-        if num_antennas > 0:
-            for antenna in rx_ant_stats.values():  # Antenna data is stored in a dict, so use .values()
-                if len(antenna) >= 6:  # Check if antenna data has enough values to access rssi_avg and snr_avg
-                    rssi_avg = antenna[2]  # rssi_avg is at index 2
-                    snr_avg = antenna[5]  # snr_avg is at index 5 (assuming it's the middle of min, avg, max)
-                    rssi_values.append(rssi_avg)
-                    snr_values.append(snr_avg)
-                else:
-                    if verbose_mode:
-                        print(f"Warning: Antenna data is incomplete: {antenna}")
-        else:
-            if verbose_mode:
-                print("Warning: No antenna stats available")
-            link_health_score_rssi = 1000  # Default to 1000 when no antenna stats are available
-            link_health_score_snr = 1000  # Optionally set default SNR as well if needed
-            best_antennas_rssi = [-105, -105, -105, -105]  # Set default RSSI values for missing antennas
-            best_antennas_snr = [-105, -105, -105, -105]  # Set default SNR values for missing antennas
-            return link_health_score_rssi, link_health_score_snr  # Exit early if no antennas
-
-        # Sort RSSI and SNR values to get the best 4 antennas
-        rssi_values.sort(reverse=True)
-        snr_values.sort(reverse=True)
-
-        best_antennas_rssi = rssi_values[:4]  # Get the top 4 antennas' RSSI values
-        best_antennas_rssi += [-105] * (4 - len(best_antennas_rssi))  # If fewer than 4 antennas, pad with -105
-
-        best_antennas_snr = snr_values[:4]  # Get the top 4 antennas' SNR values
-        best_antennas_snr += [-105] * (4 - len(best_antennas_snr))  # If fewer than 4 antennas, pad with -105
-
-        # Calculate link health score for RSSI
-        if use_best_rssi:
-            rssi_to_use = best_antennas_rssi[0]  # Use the best RSSI
-        else:
-            rssi_to_use = sum(best_antennas_rssi) / 4  # Use the average of the best 4 RSSI values
-
-        if rssi_to_use > max_rssi:
-            link_health_score_rssi = 2000  # Max health when RSSI is better than max_rssi
-        elif rssi_to_use < min_rssi:
-            link_health_score_rssi = 1000  # Min health when RSSI is worse than min_rssi
-        else:
-            # Linear interpolation between min_rssi and max_rssi mapped to 1000 and 2000
-            link_health_score_rssi = 1000 + ((rssi_to_use - min_rssi) / (max_rssi - min_rssi)) * 1000
-
-        # Calculate link health score for SNR
-        if use_best_rssi:
-            avg_best_snr = best_antennas_snr[0]  # Use the best snr
-        else:
-            avg_best_snr = sum(best_antennas_snr) / 4
-        if avg_best_snr > max_snr:
-            link_health_score_snr = 2000  # Max health when SNR is better than max_snr
-        elif avg_best_snr < min_snr:
-            link_health_score_snr = 1000  # Min health when SNR is worse than min_snr
-        else:
-            # Linear interpolation between min_snr and max_snr mapped to 1000 and 2000
-            link_health_score_snr = 1000 + ((avg_best_snr - min_snr) / (max_snr - min_snr)) * 1000
-        
-        # Implement hysteresis logic
-        #rssi_change = abs(link_health_score_rssi - previous_link_health_score_rssi) / previous_link_health_score_rssi if previous_link_health_score_rssi else 1
-        #snr_change = abs(link_health_score_snr - previous_link_health_score_snr) / previous_link_health_score_snr if previous_link_health_score_snr else 1
-
-        #if (rssi_change > 0.15) or (link_health_score_rssi > previous_link_health_score_rssi):
-        #    previous_link_health_score_rssi = link_health_score_rssi
-
-        #if (snr_change > 0.15) or (link_health_score_snr > previous_link_health_score_snr):
-        #    previous_link_health_score_snr = link_health_score_snr
-        
-        
-        # Round the health scores to the nearest integer
-        link_health_score_rssi = round(link_health_score_rssi)
-        link_health_score_snr = round(link_health_score_snr)
-
-        
-        if verbose_mode:
-            print(f"Calculated Health Score RSSI: {link_health_score_rssi}, SNR: {link_health_score_snr}, Recovered: {recovered_packets}, Lost: {lost_packets}, Best Antennas RSSI: {best_antennas_rssi}, Best Antennas SNR: {best_antennas_snr}")
-        
-        return link_health_score_rssi, link_health_score_snr
-    
+        with open(target, 'w') as f:
+            f.write(DEFAULT_CONFIG)
+        print(f"Created default config file at {target}")
     except Exception as e:
-        if verbose_mode:
-            print(f"Error calculating link health: {e}, video_rx data: {video_rx}")
-        return 1000, 1000  # Return worst-case score if something goes wrong
+        print(f"Error writing default config file: {e}")
+
+def load_configuration(config_file):
+    config = configparser.ConfigParser()
+    read_files = config.read(config_file)
+    # Check if file is missing or doesn't contain all required sections
+    if not read_files or not REQUIRED_SECTIONS.issubset(set(config.sections())):
+        print("Configuration file missing or invalid. Creating default configuration...")
+        create_default_config(config_file)
+        config.read(config_file)
+    return config
 
 def send_udp(message):
-    """
-    Adds message length to the start and sends message on provided port
-    """
-    if verbose_mode:
-        print("send_udp function has started")  # Debug statement to confirm function start
-            
-    # Prepend the size of the message as a 4-byte unsigned integer
     message_bytes = message.encode('utf-8')
-    message_size = struct.pack('!I', len(message_bytes))  # Use network byte order (big-endian)
-
-    # Full message with size prefix
+    message_size = struct.pack('!I', len(message_bytes))  # Network byte order (big-endian)
     full_message = message_size + message_bytes
-    
-    if verbose_mode:
-        print("Preparing UDP message to be sent")  # Debug statement
-    
-    # Send the message
+
     try:
         udp_socket.sendto(full_message, (udp_ip, udp_port))
         if verbose_mode:
-            print(f"UDP Message Sent: {message} (size: {len(message_bytes)} bytes)")
+            print(f"\nUDP Message Sent: {message} (size: {len(message_bytes)} bytes)\n")
     except Exception as e:
         if verbose_mode:
             print(f"Error sending UDP data: {e}")
 
-def generate_package():
+def generate_message():
+    global keyframe_request_code, keyframe_request_remaining
+    timestamp = int(time.time())
+
+    # Base message without keyframe request code
+    message = f"{timestamp}:{int(final_score)}:{int(final_score)}:{int(fec_rec_packets)}:{int(lost_packets)}:{int(best_rssi)}:{int(best_snr)}:{int(num_antennas)}:{int(penalty)}:{int(fec_change)}"
+
+    # If there is an active keyframe request, tack the unique code onto the message.
+    if keyframe_request_code is not None and keyframe_request_remaining > 0:
+        message = f"{message}:{keyframe_request_code}"
+        keyframe_request_remaining -= 1
+        if keyframe_request_remaining == 0:
+            keyframe_request_code = None
+
+    send_udp(message)
+
+def kalman_filter_update(measurement):
+    global kalman_estimate, kalman_error_estimate
+
+    predicted_estimate = kalman_estimate
+    predicted_error = kalman_error_estimate + process_variance
+
+    kalman_gain = predicted_error / (predicted_error + measurement_variance)
+
+    kalman_estimate = predicted_estimate + kalman_gain * (measurement - predicted_estimate)
+    kalman_error_estimate = (1 - kalman_gain) * predicted_error
+
+    return kalman_estimate
+
+def adjust_fec_recovered(fec_rec, fec_k, fec_n):
     """
-    Generate, at interval, string with all the variables
+    If redundancy is high (fec_n - fec_k is large), then we expect more fec_rec,
+    so its contribution is reduced.
     """
-    global recovered_packets_accumulator, last_accumulator_reset  # Declare as global to modify outer variables
-    message_interval = int(config['Settings']['message_interval']) / 1000  # Convert to seconds
-    
-    while True:
-        timestamp = int(time.time())  # Get epoch time in seconds since 1970
-        current_time = time.time()
+    if fec_k is None or fec_n is None or fec_n == 0:
+        return fec_rec  # fallback if values are not available
 
-        if current_time - last_accumulator_reset >= accumulator_period:
-            # Use and reset the accumulated value
-            recovered_packet_count = recovered_packets_accumulator
-            recovered_packets_accumulator = 0  # Reset accumulator
-            last_accumulator_reset = current_time
-        else:
-            # Continue using the current accumulated value
-            recovered_packet_count = recovered_packets_accumulator
-        
-        # Include best antennas in the message
-        #message = f"{timestamp}:{link_health_score_rssi}:{link_health_score_snr}:{recovered_packets}:{lost_packets}:{best_antennas_rssi[0]}:{best_antennas_snr[0]}:{best_antennas_snr[1]}:{best_antennas_snr[2]}"
-        
-        message = f"{timestamp}:{link_health_score_rssi}:{link_health_score_snr}:{recovered_packets}:{recovered_packet_count}:{best_antennas_rssi[0]}:{best_antennas_snr[0]}:{best_antennas_snr[1]}:{best_antennas_snr[2]}"
-        
-        
-        # Pass the message to send_udp function
-        send_udp(message)
-                
-        time.sleep(message_interval)  # Send at the specified interval
+    redundancy = fec_n - fec_k
+    weight = 6.0 / (1 + redundancy)  # 6 makes 8/12 fec neutral
+    return fec_rec * weight
 
+def calculate_link():
+    global best_rssi, best_snr, lost_packets, fec_rec_packets, final_score, penalty, fec_change, keyframe_request_code, keyframe_request_remaining
 
-def connect_and_receive_msgpack():
-    global results, link_health_score_rssi, link_health_score_snr, recovered_packets, lost_packets, best_antennas_rssi, best_antennas_snr
-    global udp_socket, udp_ip, udp_port  # Make the UDP socket, IP, and port available globally
-    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # Create UDP socket
+    # Start or override a keyframe request if necessary
+    if lost_packets > 0 and allow_idr:
+        keyframe_request_code = ''.join(random.choices(string.ascii_lowercase, k=4))
+        keyframe_request_remaining = idr_max_messages
+        if verbose_mode:
+            print(f"Generated new keyframe request code: {keyframe_request_code}")
 
-    # Get host, port, and UDP destination from the config
-    host = config['Settings']['host']
-    port = int(config['Settings']['port'])
-    udp_ip = config['Settings']['udp_ip']
-    udp_port = int(config['Settings']['udp_port'])
-    retry_interval = int(config['Settings']['retry_interval'])  # Get retry interval from config
-    
-    # Start UDP sending in a separate thread
-    udp_thread = threading.Thread(target=generate_package, daemon=True)  # Change here to call generate_package
-    udp_thread.start()
+    if all_packets == 0 or num_antennas == 0:
+        filtered_noise = 0
+        error_ratio = 0
+    else:
+        # Adjust the fec_rec_packets contribution based on FEC settings
+        adjusted_fec_rec = adjust_fec_recovered(fec_rec_packets, fec_k, fec_n)
+        # Now calculate the error ratio with the adjusted fec recovery value
+        error_ratio = (5 * lost_packets + adjusted_fec_rec) / (all_packets / num_antennas)
+        filtered_noise = kalman_filter_update(error_ratio)
 
+    if verbose_mode:
+        print(f"\nRaw noise ratio: {error_ratio:.3f}\nFiltered noise ratio: {filtered_noise:.3f}")
+
+    # Normalize SNR and RSSI to a 0-1 scale.
+    snr_normalized = max(0, min(1, (best_snr - SNR_MIN) / (SNR_MAX - SNR_MIN)))
+    rssi_normalized = max(0, min(1, (best_rssi - RSSI_MIN) / (RSSI_MAX - RSSI_MIN)))
+    score_normalized = (snr_weight * snr_normalized) + (rssi_weight * rssi_normalized)
+    raw_score = 1000 + score_normalized * 1000
+
+    # Penalty logic based on noise estimation
+    if filtered_noise < min_noise:
+        deduction_ratio = 0.0
+    else:
+        deduction_ratio = min(((filtered_noise - min_noise) / (max_noise - min_noise)) ** deduction_exponent, 1.0)
+
+    final_score = 1000 + (raw_score - 1000) * (1 - deduction_ratio) if allow_penalty else raw_score
+    penalty = (final_score - raw_score) if allow_penalty else 0
+
+    # FEC change logic  
+    fec_change = (
+        0 if not allow_fec_increase or filtered_noise <= min_noise_for_fec_change else  
+        5 if filtered_noise >= noise_for_max_fec_change else  
+        int(round(((filtered_noise - min_noise_for_fec_change) / (max_noise - min_noise_for_fec_change)) * 5))  
+    )
+
+    if verbose_mode:
+        print(f"Noise triggered fec_change: {fec_change}, penalty: {penalty:.3f}")
+
+    generate_message()
+
+def connect_to_server(host, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
+    print(f"\nReceiving wfb-ng stats from {host}:{port}")
+    return sock
+
+def print_video_metrics(rx_mcs):
+    print("\nReceiving_video:", receiving_video)
+    print(f"MCS: {rx_mcs} | fec_k: {fec_k} | fec_n: {fec_n}\n")
+    print(f"Num_antennas: {num_antennas} | Best_rssi: {best_rssi} | Best_snr: {best_snr}")
+    print("\nall_packets:", all_packets)
+    print("avg packets per antenna:", (all_packets / num_antennas) if num_antennas > 0 else 0)
+    print("Fec_rec:", fec_rec_packets)
+    print("Lost:", lost_packets)
+
+def handle_video_rx_stats(data):
+    global best_rssi, best_snr, all_packets, fec_rec_packets, lost_packets
+    global fec_k, fec_n, receiving_video, num_antennas, waiting_for_video_printed, video_rx_initial_message_printed
+    global keyframe_request_code, keyframe_request_remaining
+
+    packets = data.get("packets", {})
+    all_packets = packets.get("all", [0])[0]
+    # Determine if we're receiving video
+    receiving_video = (all_packets != 0)
+
+    fec_rec_packets = packets.get("fec_rec", [0])[0]
+    lost_packets = packets.get("lost", [0])[0]
+
+    session = data.get("session") or {}
+    fec_k = session.get("fec_k")
+    fec_n = session.get("fec_n")
+
+    rx_ant_stats = data.get("rx_ant_stats", [])
+    num_antennas = len(rx_ant_stats)
+
+    best_rssi = -101
+    best_snr = 0
+    rx_mcs = 0
+    for ant in rx_ant_stats:
+        rssi = ant.get("rssi_avg")
+        snr = ant.get("snr_avg")
+        mcs_val = ant.get("mcs")
+        if rssi is not None and rssi > best_rssi:
+            best_rssi = rssi
+        if snr is not None and snr > best_snr:
+            best_snr = snr
+        if mcs_val is not None and mcs_val > rx_mcs:
+            rx_mcs = mcs_val
+
+    if receiving_video:
+        # When video transmission starts, trigger a keyframe request.
+        # This block runs only on the first video stat update after a period of no video.
+        if not video_rx_initial_message_printed:
+            print("\nReceiving video_rx stats\nWorking...")
+            video_rx_initial_message_printed = True
+
+            # Always request a keyframe when video starts
+            keyframe_request_code = ''.join(random.choices(string.ascii_lowercase, k=4))
+            keyframe_request_remaining = idr_max_messages
+            if verbose_mode:
+                print(f"Generated new keyframe request code on video start: {keyframe_request_code}")
+
+        waiting_for_video_printed = False
+        calculate_link()
+        if verbose_mode:
+            print_video_metrics(rx_mcs)
+    else:
+        video_rx_initial_message_printed = False
+        if not waiting_for_video_printed:
+            print("\nWaiting for video_rx stats...")
+            waiting_for_video_printed = True
+
+def process_data_line(line):
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+def listen_for_data(sock):
+    global waiting_for_video_printed
+    waiting_for_video_printed = False
+    with sock.makefile() as f:
+        for line in f:
+            if not line:
+                break
+            data = process_data_line(line)
+            if data is None:
+                continue
+            if data.get("type") == "rx" and data.get("id") == "video rx":
+                handle_video_rx_stats(data)
+            else:
+                global receiving_video
+                receiving_video = False
+
+def connect_to_wfb_stats():
+    # Use the JSON data settings (HOST and PORT) from config
     while True:
         try:
-            # Create a TCP/IP socket for receiving data
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
-                # Connect to the remote server
-                if verbose_mode:
-                    print(f"Connecting to {host}:{port}...")
-                client_socket.connect((host, port))
-                if verbose_mode:
-                    print(f"Connected to {host}:{port}")
-
-                while True:
-                    # First, read 4 bytes for the length prefix
-                    length_prefix = client_socket.recv(4)
-                    if not length_prefix:
-                        if verbose_mode:
-                            print("No more data, connection closed.")
-                        break
-
-                    # Unpack the 4-byte length prefix (uint32)
-                    msg_length = struct.unpack('!I', length_prefix)[0]
-
-                    # Now read the actual MessagePack data of the given length
-                    data = b""
-                    while len(data) < msg_length:
-                        chunk = client_socket.recv(min(4096, msg_length - len(data)))
-                        if not chunk:
-                            if verbose_mode:
-                                print("Incomplete data, connection closed.")
-                            break
-                        data += chunk
-
-                    # If we successfully received the full message, unpack it
-                    if len(data) == msg_length:
-                        try:
-                            unpacked_data = msgpack.unpackb(data, use_list=False, strict_map_key=False)
-                            results.append(unpacked_data)  # Append to the results array
-
-                            # Process video_rx message
-                            if unpacked_data.get("type") == "rx" and unpacked_data.get("id") == "video rx":
-                                link_health_score_rssi, link_health_score_snr = calculate_link_health(unpacked_data)
-                                if verbose_mode:
-                                    print(f"Link Health Score RSSI: {link_health_score_rssi}, SNR: {link_health_score_snr}, Best Antennas RSSI: {best_antennas_rssi}, Best Antennas SNR: {best_antennas_snr}")
-                                
-                        except msgpack.UnpackException as e:
-                            if verbose_mode:
-                                print(f"Failed to unpack data: {e}")
-                    else:
-                        if verbose_mode:
-                            print("Failed to receive full data, closing connection.")
-                        break
-        except Exception as e:
-            if verbose_mode:
-                print(f"Connection failed or lost: {e}. Retrying in {retry_interval} seconds...")
-            time.sleep(retry_interval)  # Wait before retrying connection
+            sock = connect_to_server(HOST, PORT)
+            listen_for_data(sock)
+        except (socket.error, ConnectionRefusedError) as e:
+            print(f"\n! Check VRX adapter(s)...\nNo connection to wfb-ng stats\n{e}\nRetrying in 3 seconds...")
+            time.sleep(3)
 
 if __name__ == "__main__":
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description="TCP MessagePack client with UDP link health reporting and configuration.")
-    parser.add_argument('--config', type=str, help='Path to configuration file', default='config.ini')  # New config argument
-    parser.add_argument('--verbose', action='store_true', help='Enable verbose mode for logging')  # Verbose argument added
-    
-    # Parse the arguments
+    parser = argparse.ArgumentParser(description="xlink_gs")
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose mode for logging')
+    parser.add_argument('--config', type=str, default='/etc/alink_gs.conf',
+                        help='Path to configuration file (default: /etc/alink_gs.conf)')
     args = parser.parse_args()
-
-    # Enable verbose mode if specified
-    global verbose_mode
     verbose_mode = args.verbose
 
-    # Load the config from the specified location
-    load_config(args.config)
+    # Load configuration from the specified file
+    config = load_configuration(args.config)
 
-    # Connect to the remote server and start receiving data
-    connect_and_receive_msgpack()
+    # Outgoing settings (UDP)
+    udp_ip = config.get('outgoing', 'udp_ip')
+    udp_port = config.getint('outgoing', 'udp_port')
+
+    # JSON data settings
+    HOST = config.get('json', 'HOST')
+    PORT = config.getint('json', 'PORT')
+
+    # Weights
+    snr_weight = config.getfloat('weights', 'snr_weight')
+    rssi_weight = config.getfloat('weights', 'rssi_weight')
+
+    # Ranges for SNR and RSSI
+    SNR_MIN = config.getint('ranges', 'SNR_MIN')
+    SNR_MAX = config.getint('ranges', 'SNR_MAX')
+    RSSI_MIN = config.getint('ranges', 'RSSI_MIN')
+    RSSI_MAX = config.getint('ranges', 'RSSI_MAX')
+
+    # Keyframe settings
+    allow_idr = config.getboolean('keyframe', 'allow_idr')
+    idr_max_messages = config.getint('keyframe', 'idr_max_messages')
+
+    # Dynamic refinement settings
+    allow_penalty = config.getboolean('dynamic refinement', 'allow_penalty')
+    allow_fec_increase = config.getboolean('dynamic refinement', 'allow_fec_increase')
+
+    # Noise and penalty parameters
+    min_noise = config.getfloat('noise', 'min_noise')
+    max_noise = config.getfloat('noise', 'max_noise')
+    deduction_exponent = config.getfloat('noise', 'deduction_exponent')
+    min_noise_for_fec_change = config.getfloat('noise', 'min_noise_for_fec_change')
+    noise_for_max_fec_change = config.getfloat('noise', 'noise_for_max_fec_change')
+
+    # Error estimation parameters
+    kalman_estimate_default = config.getfloat('error estimation', 'kalman_estimate')
+    kalman_error_estimate_default = config.getfloat('error estimation', 'kalman_error_estimate')
+    process_variance = config.getfloat('error estimation', 'process_variance')
+    measurement_variance = config.getfloat('error estimation', 'measurement_variance')
+
+    # Global state variables
+    best_rssi = None
+    best_snr = None
+    all_packets = None
+    fec_rec_packets = None
+    lost_packets = None
+    fec_k = None
+    fec_n = None
+    receiving_video = None
+    num_antennas = None
+    penalty = 0
+    fec_change = 0
+    final_score = 1000
+    waiting_for_video_printed = False
+    video_rx_initial_message_printed = False
+
+    # Keyframe request globals
+    keyframe_request_code = None
+    keyframe_request_remaining = 0
+
+    # Kalman Filter variables for noise estimation – initialized from config values
+    kalman_estimate = kalman_estimate_default
+    kalman_error_estimate = kalman_error_estimate_default
+
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    connect_to_wfb_stats()

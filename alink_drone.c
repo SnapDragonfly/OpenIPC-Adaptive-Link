@@ -12,7 +12,9 @@
 #include <time.h>               // For timespec, clock_gettime
 #include <math.h>
 #include <ctype.h>
+#include <limits.h>
 
+#define MAX_COMMAND_SIZE 256
 #define BUFFER_SIZE 1024
 #define DEFAULT_PORT 9999
 #define DEFAULT_IP "10.5.0.10"
@@ -49,14 +51,13 @@ typedef struct {
 } osd_udp_config_t;
 
 // OSD strings
-char global_profile_osd[64] = "initializing...";
+char global_profile_osd[48] = "initializing...";
+char global_profile_fec_osd[16] = "0/0";
 char global_regular_osd[64] = "&L%d0&F%d&B &C tx&Wc";
 char global_gs_stats_osd[64] = "waiting for gs.";
-char global_extra_stats_osd[64] = "initializing...";
+char global_extra_stats_osd[256] = "initializing...";
 char global_score_related_osd[64] = "initializing...";
 
-// 0 no custom OSD
-// 4 all
 int osd_level = 4;
 
 
@@ -66,19 +67,29 @@ int global_fps = 120;
 int total_pixels = 2073600;
 int set_osd_font_size = 20;
 int set_osd_colour = 7;
+float multiply_font_size_by = 0.5;
+
+int num_antennas = 0;
+int num_antennas_drone = 0;
+int noise_pnlty = 0;
+int fec_change = 0;
+int prev_fec_change = 0;
 
 int prevWfbPower = -1;
 float prevSetGop = -1.0;
 int prevBandwidth = -20;
 char prevSetGI[10] = "-1";
 int prevSetMCS = -1;
+char prevROIqp[20] = "-1";
 int prevSetFecK = -1;
 int prevSetFecN = -1;
 int prevSetBitrate = -1;
-char prevROIqp[20] = "-1";
 int prevDivideFpsBy = -1;
 int prevFPS = -1;
 int prevQpDelta = -100;
+int old_bitrate = -1;
+int old_fec_k = -1;
+int old_fec_n = -1;
 
 
 int tx_factor = 50;  // Default tx power factor 50 (most cards)
@@ -97,27 +108,24 @@ int min_between_changes_ms = 100;
 int request_keyframe_interval_ms = 50;
 bool allow_request_keyframe = 1;
 bool allow_rq_kf_by_tx_d = 1;
+int check_xtx_period_ms = 500;
 int hysteresis_percent = 15;
 int hysteresis_percent_down = 5;
 int baseline_value = 100;
 float smoothing_factor = 0.5;
 float smoothing_factor_down = 0.8;
 float smoothed_combined_value = 1500;
-int max_fec_rec_penalty = 200;
 bool limitFPS = 1;
 bool get_card_info_from_yaml = false;
 
-int applied_penalty = 0;
-struct timespec penalty_timestamp;
-int fec_rec_alarm = 20;
-int fec_rec_penalty = 150;
-int apply_penalty_for_s = 3;
+bool allow_dynamic_fec = 1;
+bool fec_k_adjust = 0;
 
 int fallback_ms = 1000;
 bool idr_every_change = false;
 bool roi_focus_mode = false;
 
-char fpsCommandTemplate[150], powerCommandTemplate[100], qpDeltaCommandTemplate[150], mcsCommandTemplate[100], bitrateCommandTemplate[150], gopCommandTemplate[100], fecCommandTemplate[100], roiCommandTemplate[150], idrCommandTemplate[100], msposdCommandTemplate[384];
+char fpsCommandTemplate[150], powerCommandTemplate[100], qpDeltaCommandTemplate[150], mcsCommandTemplate[100], bitrateCommandTemplate[150], gopCommandTemplate[100], fecCommandTemplate[100], roiCommandTemplate[150], idrCommandTemplate[100];
 bool verbose_mode = false;
 bool selection_busy = false;
 bool initialized_by_first_message = false;
@@ -138,6 +146,92 @@ int total_keyframe_requests = 0;
 int total_keyframe_requests_xtx = 0;
 long global_total_tx_dropped = 0;
 
+
+volatile int weak_antenna_detected = 0;
+// monitor drone antenna rssi
+void *parse_rssi_thread(void *arg) {
+    const char *FIFO_PATH = "/tmp/wfb_rx.log";
+    const int MAX_LINE = 512;
+    const int NUM_ANTENNAS = 4; //max
+    const int HISTORY_SIZE = 20;
+    const int RSSI_THRESHOLD = 20;  // to trigger flag
+
+    FILE *fp = fopen(FIFO_PATH, "r");
+    if (!fp) {
+        perror("Failed to open FIFO, not tracking local wfb_rx tunnel stats\nIf you want to track these, add the logic to your wifibroadcast script");
+        pthread_exit(NULL);
+    }
+
+    int rssi_history[NUM_ANTENNAS][HISTORY_SIZE];
+    int rssi_index[NUM_ANTENNAS];
+    int rssi_avg[NUM_ANTENNAS];
+    int rssi_count[NUM_ANTENNAS];
+
+    // Initialize arrays
+    for (int i = 0; i < NUM_ANTENNAS; i++) {
+        rssi_index[i] = 0;
+        rssi_avg[i] = 0;
+        rssi_count[i] = 0;
+        for (int j = 0; j < HISTORY_SIZE; j++) {
+            rssi_history[i][j] = 0;
+        }
+    }
+
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "RX_ANT")) {
+            char freq_mcs_band[64], colon_values[128];
+            int antenna, timestamp;
+            
+            if (sscanf(line, "%d RX_ANT %63s %d %127[^\n]", &timestamp, freq_mcs_band, &antenna, colon_values) == 4) {
+                if (antenna < 0 || antenna >= NUM_ANTENNAS) continue; // Ignore invalid antennas
+				if (antenna >= num_antennas_drone) {
+					num_antennas_drone = antenna + 1;  // Update global
+				}
+                
+                char *token;
+                int token_count = 0, rssi = 0;
+                token = strtok(colon_values, ":");
+                while (token) {
+                    if (++token_count == 3) {  // RSSI is the third field
+                        rssi = atoi(token);
+                        break;
+                    }
+                    token = strtok(NULL, ":");
+                }
+
+                // Store RSSI in history buffer
+                rssi_history[antenna][rssi_index[antenna] % HISTORY_SIZE] = rssi;
+                rssi_index[antenna]++;
+                rssi_count[antenna]++;
+
+                // Compute moving average
+                int sum = 0, count = rssi_count[antenna] < HISTORY_SIZE ? rssi_count[antenna] : HISTORY_SIZE;
+                for (int i = 0; i < count; i++) {
+                    sum += rssi_history[antenna][i];
+                }
+                rssi_avg[antenna] = sum / count;
+
+                // Detect weak antenna
+                int min_rssi = INT_MAX, max_rssi = INT_MIN;
+                for (int i = 0; i < NUM_ANTENNAS; i++) {
+                    if (rssi_count[i] > 0) {
+                        if (rssi_avg[i] < min_rssi) min_rssi = rssi_avg[i];
+                        if (rssi_avg[i] > max_rssi) max_rssi = rssi_avg[i];
+                    }
+                }
+                if (max_rssi - min_rssi >= RSSI_THRESHOLD) {
+                    weak_antenna_detected = 1;
+                } else {
+                    weak_antenna_detected = 0;
+                }
+            }
+        }
+    }
+
+    fclose(fp);
+    pthread_exit(NULL);
+}
 
 void error_to_osd(const char *message) {
     const char *prefix = "&L50&F30 ";
@@ -187,9 +281,11 @@ int get_resolution() {
         return 1;
     }
 
-    // Read the output of the command
-    fgets(resolution, sizeof(resolution) - 1, fp);
-    pclose(fp);
+    if (fgets(resolution, sizeof(resolution) - 1, fp) == NULL) {
+		printf("fgets failed\n");
+	}
+	
+	pclose(fp);
 
     // Parse the resolution in the format <x_res>x<y_res>
     if (sscanf(resolution, "%dx%d", &x_res, &y_res) != 2) {
@@ -198,6 +294,8 @@ int get_resolution() {
     }
 
 	printf("Video Size: %dx%d\n", x_res, y_res);
+    return 0;
+
 
 }
 
@@ -206,23 +304,21 @@ void load_config(const char* filename) {
     if (!file) {
         fprintf(stderr, "Error: Could not open configuration file: %s\n", filename);
         perror("");
-		error_to_osd("Adaptive-Link: Check /etc/alink.conf");
+        error_to_osd("Adaptive-Link: Check/update /etc/alink.conf");
         exit(EXIT_FAILURE);
     }
 
     char line[BUFFER_SIZE];
     while (fgets(line, sizeof(line), file)) {
         // Ignore comments (lines starting with '#')
-        if (line[0] == '#') {
+        if (line[0] == '#')
             continue;
-        }
 
         char *key = strtok(line, "=");
         char *value = strtok(NULL, "\n");
 
         if (key && value) {
-		
-			if (strcmp(key, "allow_set_power") == 0) {
+            if (strcmp(key, "allow_set_power") == 0) {
                 allow_set_power = atoi(value);
             } else if (strcmp(key, "rssi_weight") == 0) {
                 rssi_weight = atof(value);
@@ -234,78 +330,82 @@ void load_config(const char* filename) {
                 hold_modes_down_s = atoi(value);
             } else if (strcmp(key, "min_between_changes_ms") == 0) {
                 min_between_changes_ms = atoi(value);
-			} else if (strcmp(key, "request_keyframe_interval_ms") == 0) {
+            } else if (strcmp(key, "request_keyframe_interval_ms") == 0) {
                 request_keyframe_interval_ms = atoi(value);
-			} else if (strcmp(key, "fallback_ms") == 0) {
+            } else if (strcmp(key, "fallback_ms") == 0) {
                 fallback_ms = atoi(value);
-			} else if (strcmp(key, "idr_every_change") == 0) {
+            } else if (strcmp(key, "idr_every_change") == 0) {
                 idr_every_change = atoi(value);
-			} else if (strcmp(key, "allow_request_keyframe") == 0) {
+            } else if (strcmp(key, "allow_request_keyframe") == 0) {
                 allow_request_keyframe = atoi(value);
-			} else if (strcmp(key, "allow_rq_kf_by_tx_d") == 0) {
+			} else if (strcmp(key, "get_card_info_from_yaml") == 0) {
+                get_card_info_from_yaml = atoi(value);	
+						
+			} else if (strcmp(key, "allow_dynamic_fec") == 0) {
+                allow_dynamic_fec = atoi(value);
+			
+			} else if (strcmp(key, "fec_k_adjust") == 0) {
+                fec_k_adjust = atoi(value);
+				
+            } else if (strcmp(key, "allow_rq_kf_by_tx_d") == 0) {
                 allow_rq_kf_by_tx_d = atoi(value);
-			} else if (strcmp(key, "hysteresis_percent") == 0) {
+            } else if (strcmp(key, "hysteresis_percent") == 0) {
                 hysteresis_percent = atoi(value);
-			} else if (strcmp(key, "hysteresis_percent_down") == 0) {
+            } else if (strcmp(key, "hysteresis_percent_down") == 0) {
                 hysteresis_percent_down = atoi(value);
-			} else if (strcmp(key, "exp_smoothing_factor") == 0) {
+            } else if (strcmp(key, "exp_smoothing_factor") == 0) {
                 smoothing_factor = atof(value);
-			} else if (strcmp(key, "exp_smoothing_factor_down") == 0) {
+            } else if (strcmp(key, "exp_smoothing_factor_down") == 0) {
                 smoothing_factor_down = atof(value);
-			} else if (strcmp(key, "roi_focus_mode") == 0) {
+            } else if (strcmp(key, "roi_focus_mode") == 0) {
                 roi_focus_mode = atoi(value);
-			} else if (strcmp(key, "fec_rec_alarm") == 0) {
-                fec_rec_alarm = atoi(value);
-            } else if (strcmp(key, "fec_rec_penalty") == 0) {
-                fec_rec_penalty = atoi(value);
-            } else if (strcmp(key, "apply_penalty_for_s") == 0) {
-                apply_penalty_for_s = atoi(value);
-				
-			} else if (strcmp(key, "allow_spike_fix_fps") == 0) {
+            
+            } else if (strcmp(key, "allow_spike_fix_fps") == 0) {
                 limitFPS = atoi(value);
-			} else if (strcmp(key, "max_fec_rec_penalty") == 0) {
-                max_fec_rec_penalty = atoi(value);	
-				
-			} else if (strcmp(key, "osd_level") == 0) {
-                osd_level = atoi(value);	
-											
-            } else if (strcmp(key, "powerCommand") == 0) {
-                strncpy(powerCommandTemplate, value, sizeof(powerCommandTemplate));
-			} else if (strcmp(key, "fpsCommandTemplate") == 0) {
-                strncpy(fpsCommandTemplate, value, sizeof(fpsCommandTemplate));
-			} else if (strcmp(key, "qpDeltaCommand") == 0) {
-                strncpy(qpDeltaCommandTemplate, value, sizeof(qpDeltaCommandTemplate));	
-            } else if (strcmp(key, "mcsCommand") == 0) {
-                strncpy(mcsCommandTemplate, value, sizeof(mcsCommandTemplate));
-            } else if (strcmp(key, "bitrateCommand") == 0) {
-                strncpy(bitrateCommandTemplate, value, sizeof(bitrateCommandTemplate));
-            } else if (strcmp(key, "gopCommand") == 0) {
-                strncpy(gopCommandTemplate, value, sizeof(gopCommandTemplate));
-            } else if (strcmp(key, "fecCommand") == 0) {
-                strncpy(fecCommandTemplate, value, sizeof(fecCommandTemplate));
-            } else if (strcmp(key, "roiCommand") == 0) {
-                strncpy(roiCommandTemplate, value, sizeof(roiCommandTemplate));
-            } else if (strcmp(key, "idrCommand") == 0) {
-                strncpy(idrCommandTemplate, value, sizeof(idrCommandTemplate));
-			} else if (strcmp(key, "customOSD") == 0) {
-                strncpy(global_regular_osd, value, sizeof(global_regular_osd));	
-			
-				
-			}else {
-                fprintf(stderr, "Warning: Unrecognized configuration key: %s\n", key);
-				error_to_osd("Adaptive-Link: Check /etc/alink.conf");
-				exit(EXIT_FAILURE);  // Exit the program with an error status
+         
+            } else if (strcmp(key, "osd_level") == 0) {
+                osd_level = atoi(value);
+            } else if (strcmp(key, "multiply_font_size_by") == 0) {
+                multiply_font_size_by = atof(value);
+            } else if (strcmp(key, "check_xtx_period_ms") == 0) {
+                check_xtx_period_ms = atoi(value);
             }
-			
+            // New keys for command templates:
+            else if (strcmp(key, "powerCommandTemplate") == 0) {
+                strncpy(powerCommandTemplate, value, sizeof(powerCommandTemplate));
+            } else if (strcmp(key, "fpsCommandTemplate") == 0) {
+                strncpy(fpsCommandTemplate, value, sizeof(fpsCommandTemplate));
+            } else if (strcmp(key, "qpDeltaCommandTemplate") == 0) {
+                strncpy(qpDeltaCommandTemplate, value, sizeof(qpDeltaCommandTemplate));
+            } else if (strcmp(key, "mcsCommandTemplate") == 0) {
+                strncpy(mcsCommandTemplate, value, sizeof(mcsCommandTemplate));
+            } else if (strcmp(key, "bitrateCommandTemplate") == 0) {
+                strncpy(bitrateCommandTemplate, value, sizeof(bitrateCommandTemplate));
+            } else if (strcmp(key, "gopCommandTemplate") == 0) {
+                strncpy(gopCommandTemplate, value, sizeof(gopCommandTemplate));
+            } else if (strcmp(key, "fecCommandTemplate") == 0) {
+                strncpy(fecCommandTemplate, value, sizeof(fecCommandTemplate));
+            } else if (strcmp(key, "roiCommandTemplate") == 0) {
+                strncpy(roiCommandTemplate, value, sizeof(roiCommandTemplate));
+            } else if (strcmp(key, "idrCommandTemplate") == 0) {
+                strncpy(idrCommandTemplate, value, sizeof(idrCommandTemplate));
+            } else if (strcmp(key, "customOSD") == 0) {
+                strncpy(global_regular_osd, value, sizeof(global_regular_osd));
+            } else {
+                fprintf(stderr, "Warning: Unrecognized configuration key: %s\n", key);
+                error_to_osd("Adaptive-Link: Check/update /etc/alink.conf");
+                exit(EXIT_FAILURE);
+            }
         } else if (strlen(line) > 1 && line[0] != '\n') {  // ignore empty lines
             fprintf(stderr, "Error: Invalid configuration format: %s\n", line);
-			error_to_osd("Adaptive-Link: Check /etc/alink.conf");
+            error_to_osd("Adaptive-Link: Check/update /etc/alink.conf");
             exit(EXIT_FAILURE);
         }
     }
 
     fclose(file);
 }
+
 
 
 void trim_whitespace(char *str) {
@@ -405,7 +505,7 @@ int check_module_loaded(const char *module_name) {
 }
 
 void load_from_vtx_info_yaml() {
-    char command1[] = "yaml-cli -i /etc/wfb.yaml -g .broadcast.ldpc_tx";
+    char command1[] = "yaml-cli -i /etc/wfb.yaml -g .broadcast.ldpc";
     char command2[] = "yaml-cli -i /etc/wfb.yaml -g .broadcast.stbc";
     
     char buffer[128]; // Buffer to store command output
@@ -437,10 +537,10 @@ void load_from_vtx_info_yaml() {
 void determine_tx_power_equation() {
     if (check_module_loaded("88XXau")) {
         tx_factor = -100;
-		printf("Found 88XXau card, therefor...\n");
+		printf("Found 88XXau card\n");
     } else {
         tx_factor = 50;
-		printf("Did not find 88XXau, therefor...\n");
+		printf("Did not find 88XXau\n");
     }
 }
 
@@ -523,19 +623,20 @@ int setup_roi() {
         return 1;
     }
 
-    fgets(enabled_status, sizeof(enabled_status) - 1, fp);
-    pclose(fp);
+    if (fgets(enabled_status, sizeof(enabled_status) - 1, fp) == NULL) {
+		printf("fgets failed\n");
+	} 
 
     // Trim newline character
     enabled_status[strcspn(enabled_status, "\n")] = 0;
 
     // Check if enabled_status is "true" or "false"
     if (strcmp(enabled_status, "true") != 0 && strcmp(enabled_status, "false") != 0) {
-        system("cli --set .fpv.enabled true");
+		if (system("cli --set .fpv.enabled true") != 0) { printf("problem with reading fpv.enabled status\n"); }
     }
 
     // Run the command to set ROI
-    system(command);
+	if (system(command) != 0) { printf("set ROI command failed\n"); }
 
     // Check if .fpv.roiQp is set correctly
     char roi_qp_status[32];
@@ -545,7 +646,7 @@ int setup_roi() {
         return 1;
     }
 
-    fgets(roi_qp_status, sizeof(roi_qp_status) - 1, fp);
+	if (fgets(roi_qp_status, sizeof(roi_qp_status) - 1, fp) == NULL) { printf("fgets failed\n"); }
     pclose(fp);
 
     // Trim newline character
@@ -560,7 +661,7 @@ int setup_roi() {
     }
 
     if (num_count != 4) {
-        system("cli --set .fpv.roiQp 0,0,0,0");
+		if (system("cli --set .fpv.roiQp 0,0,0,0") != 0) { printf("Command failed\n"); }
     }
 
     return 0;
@@ -616,7 +717,9 @@ void execute_command_no_quotes(const char* command) {
     if (verbose_mode) {
         puts(command);
     }
-	system(command);
+	
+	if (system(command) != 0) { printf("Command failed: %s\n", command); }
+	usleep(pace_exec);
 
 }
 
@@ -628,31 +731,120 @@ void execute_command(const char* command) {
     if (verbose_mode) {
         puts(quotedCommand);
     }
-	system(quotedCommand);
+	if (system(quotedCommand) != 0) { printf("Command failed: %s\n", quotedCommand); }
 	if (verbose_mode) {
 		printf("Waiting %ldms\n", pace_exec / 1000);
     }
 	usleep(pace_exec);
 }
 
+// Replaces the first occurrence of a placeholder (e.g. "{name}") in 'str' with 'value'
+void replace_placeholder(char *str, const char *placeholder, const char *value) {
+    char buffer[MAX_COMMAND_SIZE];
+    char *pos = strstr(str, placeholder);
+    if (!pos)
+        return; // placeholder not found
+    size_t prefix_len = pos - str;
+    buffer[0] = '\0';
+    strncat(buffer, str, prefix_len);
+    strncat(buffer, value, sizeof(buffer) - strlen(buffer) - 1);
+    strncat(buffer, pos + strlen(placeholder), sizeof(buffer) - strlen(buffer) - 1);
+    strncpy(str, buffer, MAX_COMMAND_SIZE);
+    str[MAX_COMMAND_SIZE-1] = '\0';
+}
+
+// Formats a command by replacing named placeholders with the provided values.
+// 'count' is the number of keys/values, and keys/values are provided in parallel arrays.
+void format_command(char *dest, size_t dest_size, const char *template,
+                    int count, const char **keys, const char **values) {
+    char temp[MAX_COMMAND_SIZE];
+    strncpy(temp, template, sizeof(temp));
+    temp[sizeof(temp)-1] = '\0';
+    char placeholder[64];
+    for (int i = 0; i < count; i++) {
+        snprintf(placeholder, sizeof(placeholder), "{%s}", keys[i]);
+        replace_placeholder(temp, placeholder, values[i]);
+    }
+    strncpy(dest, temp, dest_size);
+    dest[dest_size-1] = '\0';
+}
+
+
+
+void manage_fec_and_bitrate(int new_fec_k, int new_fec_n, int new_bitrate) {
+    char fecCommand[MAX_COMMAND_SIZE];
+    char bitrateCommand[MAX_COMMAND_SIZE];
+
+    // Adjust fec and bitrate based on fec_change (if applicable)
+    if (allow_dynamic_fec && fec_change > 0 && fec_change <= 5) {
+        float denominators[] = { 1, 1.11111, 1.25, 1.42, 1.66667, 2.0 };
+        float denominator = denominators[fec_change];
+        new_bitrate = (int)(new_bitrate / denominator);
+        // divide k or multiply n depending on fec_k_adjust option
+		(fec_k_adjust) ? (new_fec_k /= denominator) : (new_fec_n *= denominator);
+
+    }
+    
+    // Update the global FEC OSD regardless of order.
+    snprintf(global_profile_fec_osd, sizeof(global_profile_fec_osd), "%d/%d", new_fec_k, new_fec_n);
+    
+    // If increasing bitrate, change FEC first; otherwise, bitrate first.
+    if (new_bitrate > old_bitrate) {
+        // Format fecCommand
+        const char *fecKeys[] = { "fecK", "fecN" };
+        char strFecK[10], strFecN[10];
+        snprintf(strFecK, sizeof(strFecK), "%d", new_fec_k);
+        snprintf(strFecN, sizeof(strFecN), "%d", new_fec_n);
+        const char *fecValues[] = { strFecK, strFecN };
+        format_command(fecCommand, sizeof(fecCommand), fecCommandTemplate, 2, fecKeys, fecValues);
+        execute_command(fecCommand);
+        old_fec_k = new_fec_k;
+        old_fec_n = new_fec_n;
+        
+        // Format bitrateCommand
+        const char *brKeys[] = { "bitrate" };
+        char strBitrate[12];
+        snprintf(strBitrate, sizeof(strBitrate), "%d", new_bitrate);
+        const char *brValues[] = { strBitrate };
+        format_command(bitrateCommand, sizeof(bitrateCommand), bitrateCommandTemplate, 1, brKeys, brValues);
+        execute_command(bitrateCommand);
+        old_bitrate = new_bitrate;
+    } else {
+        // Format bitrateCommand first
+        const char *brKeys[] = { "bitrate" };
+        char strBitrate[12];
+        snprintf(strBitrate, sizeof(strBitrate), "%d", new_bitrate);
+        const char *brValues[] = { strBitrate };
+        format_command(bitrateCommand, sizeof(bitrateCommand), bitrateCommandTemplate, 1, brKeys, brValues);
+        execute_command(bitrateCommand);
+        old_bitrate = new_bitrate;
+        
+        // Then format fecCommand
+        const char *fecKeys[] = { "fecK", "fecN" };
+        char strFecK[10], strFecN[10];
+        snprintf(strFecK, sizeof(strFecK), "%d", new_fec_k);
+        snprintf(strFecN, sizeof(strFecN), "%d", new_fec_n);
+        const char *fecValues[] = { strFecK, strFecN };
+        format_command(fecCommand, sizeof(fecCommand), fecCommandTemplate, 2, fecKeys, fecValues);
+        execute_command(fecCommand);
+        old_fec_k = new_fec_k;
+        old_fec_n = new_fec_n;
+    }
+}
+
 
 void apply_profile(Profile* profile) {
+    char powerCommand[MAX_COMMAND_SIZE];
+    char fpsCommand[MAX_COMMAND_SIZE];
+    char qpDeltaCommand[MAX_COMMAND_SIZE];
+    char mcsCommand[MAX_COMMAND_SIZE];
+    char gopCommand[MAX_COMMAND_SIZE];
+    char roiCommand[MAX_COMMAND_SIZE];
+    const char *idrCommand = idrCommandTemplate;  // No formatting needed
 
-    char powerCommand[100];
-	char fpsCommand[150];
-    char qpDeltaCommand[150];
-	char mcsCommand[150];
-    char bitrateCommand[150];
-    char gopCommand[100];
-    char fecCommand[100];
-    char roiCommand[150];
-    const char *idrCommand;
-    idrCommand = idrCommandTemplate;
-
-	// Calculate seconds since last change
+    // Calculate seconds since last change
     long currentTime = get_monotonic_time();
     long timeElapsed = currentTime - prevTimeStamp; // Time since the last change
-
 
     // Load current profile variables into local variables
     int currentWfbPower = profile->wfbPower;
@@ -665,148 +857,179 @@ void apply_profile(Profile* profile) {
     int currentSetBitrate = profile->setBitrate;
     char currentROIqp[20];
     strcpy(currentROIqp, profile->ROIqp);
-	int currentBandwidth = profile->bandwidth;
+    int currentBandwidth = profile->bandwidth;
     int currentQpDelta = profile->setQpDelta;
 	
-	int currentDivideFpsBy = 1;
-	int currentFPS = global_fps;
+    int currentDivideFpsBy = 1;
+    int currentFPS = global_fps;
 	
-	// Logic to calculate any FPS limit
-	if (limitFPS && currentSetBitrate < 4000 && global_fps > 30 && total_pixels > 1300000) {
-		currentFPS = 30;
-		currentDivideFpsBy = round((double)global_fps / 30);
-	} else if (limitFPS && currentSetBitrate < 8000 && total_pixels > 1300000 && global_fps > 60) {
-		currentFPS = 60;
-		currentDivideFpsBy = round((double)global_fps / 60);
-
-	}
-	
-    // Logic to determine execution order and see if values are different
+    // Determine FPS limit
+    if (limitFPS && currentSetBitrate < 4000 && global_fps > 30 && total_pixels > 1300000) {
+        currentFPS = 30;
+        currentDivideFpsBy = round((double)global_fps / 30);
+    } else if (limitFPS && currentSetBitrate < 8000 && total_pixels > 1300000 && global_fps > 60) {
+        currentFPS = 60;
+        currentDivideFpsBy = round((double)global_fps / 60);
+    }
+    
+    // --- qpDeltaCommand ---
+    {
+        const char *keys[] = { "qpDelta" };
+        char strQpDelta[10];
+        snprintf(strQpDelta, sizeof(strQpDelta), "%d", currentQpDelta);
+        const char *values[] = { strQpDelta };
+        format_command(qpDeltaCommand, sizeof(qpDeltaCommand), qpDeltaCommandTemplate, 1, keys, values);
+    }
+    // --- fpsCommand ---
+    {
+        const char *keys[] = { "fps" };
+        char strFPS[10];
+        snprintf(strFPS, sizeof(strFPS), "%d", currentFPS);
+        const char *values[] = { strFPS };
+        format_command(fpsCommand, sizeof(fpsCommand), fpsCommandTemplate, 1, keys, values);
+    }
+    // --- powerCommand ---
+    {
+        const char *keys[] = { "power" };
+        char strPower[10];
+        snprintf(strPower, sizeof(strPower), "%d", currentWfbPower * tx_factor);
+        const char *values[] = { strPower };
+        format_command(powerCommand, sizeof(powerCommand), powerCommandTemplate, 1, keys, values);
+    }
+    // --- gopCommand ---
+    {
+        const char *keys[] = { "gop" };
+        char strGop[10];
+        snprintf(strGop, sizeof(strGop), "%.1f", currentSetGop);
+        const char *values[] = { strGop };
+        format_command(gopCommand, sizeof(gopCommand), gopCommandTemplate, 1, keys, values);
+    }
+    // --- mcsCommand ---
+    {
+        const char *keys[] = { "bandwidth", "gi", "stbc", "ldpc", "mcs" };
+        char strBandwidth[10], strGI[10], strStbc[10], strLdpc[10], strMcs[10];
+        snprintf(strBandwidth, sizeof(strBandwidth), "%d", currentBandwidth);
+        snprintf(strGI, sizeof(strGI), "%s", currentSetGI);
+        snprintf(strStbc, sizeof(strStbc), "%d", stbc);
+        snprintf(strLdpc, sizeof(strLdpc), "%d", ldpc_tx);
+        snprintf(strMcs, sizeof(strMcs), "%d", currentSetMCS);
+        const char *values[] = { strBandwidth, strGI, strStbc, strLdpc, strMcs };
+        format_command(mcsCommand, sizeof(mcsCommand), mcsCommandTemplate, 5, keys, values);
+    }
+    // --- roiCommand ---
+    {
+        const char *keys[] = { "roiQp" };
+        const char *values[] = { currentROIqp };
+        format_command(roiCommand, sizeof(roiCommand), roiCommandTemplate, 1, keys, values);
+    }
+    
+    // --- Execution Logic ---
     if (currentProfile > previousProfile) {
-		
-		
-		if (currentQpDelta != prevQpDelta) {
-			sprintf (qpDeltaCommand, qpDeltaCommandTemplate, currentQpDelta);
-			execute_command(qpDeltaCommand);
-			prevQpDelta = currentQpDelta;
-		}
-		if (currentFPS != prevFPS) {
-			sprintf(fpsCommand, fpsCommandTemplate, currentFPS);
+        if (currentQpDelta != prevQpDelta) {
+            execute_command(qpDeltaCommand);
+            prevQpDelta = currentQpDelta;
+        }
+        if (currentFPS != prevFPS) {
             execute_command(fpsCommand);
-			prevFPS = currentFPS;
-		}
-
+            prevFPS = currentFPS;
+        }
         if (allow_set_power && currentWfbPower != prevWfbPower) {
-            sprintf(powerCommand, powerCommandTemplate, currentWfbPower * tx_factor);
             execute_command(powerCommand);
             prevWfbPower = currentWfbPower;
         }
         if (currentSetGop != prevSetGop) {
-            sprintf(gopCommand, gopCommandTemplate, currentSetGop);
             execute_command(gopCommand);
             prevSetGop = currentSetGop;
         }
-		
-		if (strcmp(currentSetGI, prevSetGI) != 0 || currentSetMCS != prevSetMCS || currentBandwidth != prevBandwidth) {
-            sprintf(mcsCommand, mcsCommandTemplate, currentBandwidth, currentSetGI, stbc, ldpc_tx, currentSetMCS);
+        if (strcmp(currentSetGI, prevSetGI) != 0 ||
+            currentSetMCS != prevSetMCS ||
+            currentBandwidth != prevBandwidth) {
             execute_command(mcsCommand);
-			prevBandwidth = currentBandwidth;
+            prevBandwidth = currentBandwidth;
             strcpy(prevSetGI, currentSetGI);
             prevSetMCS = currentSetMCS;
         }
-        if (currentSetFecK != prevSetFecK || currentSetFecN != prevSetFecN) {
-            sprintf(fecCommand, fecCommandTemplate, currentSetFecK, currentSetFecN);
-            execute_command(fecCommand);
+        		
+        if (currentSetFecK != prevSetFecK || currentSetFecN != prevSetFecN || currentSetBitrate != prevSetBitrate) {
+           
+		    manage_fec_and_bitrate(currentSetFecK, currentSetFecN, currentSetBitrate);
+
+            prevSetBitrate = currentSetBitrate;
+			
             prevSetFecK = currentSetFecK;
             prevSetFecN = currentSetFecN;
         }
-        if (currentSetBitrate != prevSetBitrate) {
-            sprintf(bitrateCommand, bitrateCommandTemplate, currentSetBitrate * currentDivideFpsBy);
-            execute_command(bitrateCommand);
-            prevSetBitrate = currentSetBitrate;
-        }
+		
         if (roi_focus_mode && strcmp(currentROIqp, prevROIqp) != 0) {
-            sprintf(roiCommand, roiCommandTemplate, currentROIqp);
             execute_command(roiCommand);
             strcpy(prevROIqp, currentROIqp);
         }
-		if (idr_every_change) {
-			execute_command(idrCommand);
-		}
-
+        if (idr_every_change) {
+            execute_command(idrCommand);
+        }
     } else {
-
-		if (currentQpDelta != prevQpDelta) {
-			sprintf (qpDeltaCommand, qpDeltaCommandTemplate, currentQpDelta);
-			execute_command(qpDeltaCommand);
-			prevQpDelta = currentQpDelta;
-		}
-		
-		if (currentFPS != prevFPS) {
-			sprintf(fpsCommand, fpsCommandTemplate, currentFPS);
+        if (currentQpDelta != prevQpDelta) {
+            execute_command(qpDeltaCommand);
+            prevQpDelta = currentQpDelta;
+        }
+        if (currentFPS != prevFPS) {
             execute_command(fpsCommand);
-			prevFPS = currentFPS;
-		}
+            prevFPS = currentFPS;
+        }
+        
+		if (currentSetFecK != prevSetFecK || currentSetFecN != prevSetFecN || currentSetBitrate != prevSetBitrate) {
+           
+		    manage_fec_and_bitrate(currentSetFecK, currentSetFecN, currentSetBitrate);
 
-        if (currentSetBitrate != prevSetBitrate) {
-            sprintf(bitrateCommand, bitrateCommandTemplate, currentSetBitrate * currentDivideFpsBy);
-            execute_command(bitrateCommand);
             prevSetBitrate = currentSetBitrate;
-        }
-        if (currentSetGop != prevSetGop) {
-            sprintf(gopCommand, gopCommandTemplate, currentSetGop);
-            execute_command(gopCommand);
-            prevSetGop = currentSetGop;
-        }
-        if (strcmp(currentSetGI, prevSetGI) != 0 || currentSetMCS != prevSetMCS || currentBandwidth != prevBandwidth) {
-            sprintf(mcsCommand, mcsCommandTemplate, currentBandwidth, currentSetGI, stbc, ldpc_tx, currentSetMCS);
-            execute_command(mcsCommand);
-			prevBandwidth = currentBandwidth;
-            strcpy(prevSetGI, currentSetGI);
-            prevSetMCS = currentSetMCS;
-        }
-        if (currentSetFecK != prevSetFecK || currentSetFecN != prevSetFecN) {
-            sprintf(fecCommand, fecCommandTemplate, currentSetFecK, currentSetFecN);
-            execute_command(fecCommand);
+			
             prevSetFecK = currentSetFecK;
             prevSetFecN = currentSetFecN;
         }
+		
+        if (currentSetGop != prevSetGop) {
+            execute_command(gopCommand);
+            prevSetGop = currentSetGop;
+        }
+        if (strcmp(currentSetGI, prevSetGI) != 0 ||
+            currentSetMCS != prevSetMCS ||
+            currentBandwidth != prevBandwidth) {
+            execute_command(mcsCommand);
+            prevBandwidth = currentBandwidth;
+            strcpy(prevSetGI, currentSetGI);
+            prevSetMCS = currentSetMCS;
+        }
         if (allow_set_power && currentWfbPower != prevWfbPower) {
-            sprintf(powerCommand, powerCommandTemplate, currentWfbPower * tx_factor);
             execute_command(powerCommand);
             prevWfbPower = currentWfbPower;
         }
         if (roi_focus_mode && strcmp(currentROIqp, prevROIqp) != 0) {
-            sprintf(roiCommand, roiCommandTemplate, currentROIqp);
             execute_command(roiCommand);
             strcpy(prevROIqp, currentROIqp);
         }
-
-		if (idr_every_change) {
-			execute_command(idrCommand);
-		}
+        if (idr_every_change) {
+            execute_command(idrCommand);
+        }
     }
 
-
-	// get actual values from wfb_tx_cmd for OSD
-	int k, n, stbc, ldpc, short_gi, actual_bandwidth, mcs_index, vht_mode, vht_nss;
-    read_wfb_tx_cmd_output(&k, &n, &stbc, &ldpc, &short_gi, &actual_bandwidth, &mcs_index, &vht_mode, &vht_nss);
-	const char *gi_string = short_gi ? "short" : "long";
-	//make Pw 0 if disabled else get from profile
-	int pwr = allow_set_power ? profile->wfbPower : 0;
-
-	// Generate string with profile stats for osd (now including above real stats)
-	sprintf(global_profile_osd, "%lds %d %d%s%d %d/%d Pw%d g%.1f", 
-        timeElapsed, 
-        profile->setBitrate, 
-		actual_bandwidth,
-		gi_string,
-		mcs_index,
-		k,
-		n,
-		pwr,
-        profile->setGop);
+    // Update OSD with actual values from wfb_tx_cmd output.
+    int k, n, stbc_val, ldpc_val, short_gi, actual_bandwidth, mcs_index, vht_mode, vht_nss;
+    read_wfb_tx_cmd_output(&k, &n, &stbc_val, &ldpc_val, &short_gi, &actual_bandwidth, &mcs_index, &vht_mode, &vht_nss);
+    const char *gi_string = short_gi ? "short" : "long";
+    int pwr = allow_set_power ? profile->wfbPower : 0;
+    sprintf(global_profile_osd, "%lds %d %d%s%d Pw%d g%.1f", 
+            timeElapsed, 
+            profile->setBitrate, 
+            actual_bandwidth,
+            gi_string,
+            mcs_index,
+            pwr,
+            profile->setGop);
+	
+    snprintf(global_profile_fec_osd, sizeof(global_profile_fec_osd), "%d/%d", k, n);
 }
+
+
 
 void *periodic_update_osd(void *arg) {
     osd_udp_config_t *osd_config = (osd_udp_config_t *)arg;
@@ -825,13 +1048,22 @@ void *periodic_update_osd(void *arg) {
 
     while (true) {
         sleep(1);
-
-        // Generate string with extra OSD stats to combine with other strings
-        snprintf(global_extra_stats_osd, sizeof(global_extra_stats_osd), "pnlt%d xtx%ld(%d) idr%d",
-                 applied_penalty,
-				 global_total_tx_dropped,
-				 total_keyframe_requests_xtx,
-				 total_keyframe_requests);
+    
+    // Generate extra stats string
+    snprintf(global_extra_stats_osd, sizeof(global_extra_stats_osd),
+             "pnlt%d xtx%ld(%d) gs_idr%d",
+             noise_pnlty,
+             global_total_tx_dropped,
+             total_keyframe_requests_xtx,
+             total_keyframe_requests);
+    
+    // Append the persistent VTX antenna warning if detected
+    if (weak_antenna_detected) {
+        strncat(global_extra_stats_osd,
+                "\nPersistent VTX antenna mismatch >= 20dB detected! Check antennas...",
+                sizeof(global_extra_stats_osd) - strlen(global_extra_stats_osd) - 1);
+		        printf("Weak drone antenna detected!\n");
+    }
 		
 		// Check if profile is low and set red, or yellow. Otherwise set green
 		set_osd_colour = (previousProfile < 1) ? 2 : (previousProfile < 2) ? 5 : 3;
@@ -841,19 +1073,24 @@ void *periodic_update_osd(void *arg) {
 		char local_regular_osd[64];
 		snprintf(local_regular_osd, sizeof(local_regular_osd), global_regular_osd, set_osd_colour, set_osd_font_size);
 
-		char full_osd_string[384];
+		char full_osd_string[600];
 		
 		// Combine all osd strings, decide, based on osd_level what to display
-		if (osd_level >= 4) { // everything, over multiple lines
-			snprintf(full_osd_string, sizeof(full_osd_string), "%s\n%s\n%s\n%s %s",
-					global_profile_osd, local_regular_osd, global_score_related_osd, global_gs_stats_osd, global_extra_stats_osd);
+		if (osd_level >= 5) {		 // everything, over multiple lines
+			snprintf(full_osd_string, sizeof(full_osd_string), "%s %s\n%s\n%s\n%s\n%s",
+					global_profile_osd, global_profile_fec_osd, local_regular_osd, global_score_related_osd, global_gs_stats_osd, global_extra_stats_osd);
+					
+		} else if (osd_level == 4) { // everything on one line
+			snprintf(full_osd_string, sizeof(full_osd_string), "%s %s | %s | %s | %s | %s",
+					global_profile_osd, global_profile_fec_osd, local_regular_osd, global_score_related_osd, global_gs_stats_osd, global_extra_stats_osd);
+					
         } else if (osd_level == 3) { // medium extras
-			snprintf(full_osd_string, sizeof(full_osd_string), "%s %s\n%s",
-					global_profile_osd, local_regular_osd, global_gs_stats_osd);	
+			snprintf(full_osd_string, sizeof(full_osd_string), "%s %s %s\n%s",
+					global_profile_osd, global_profile_fec_osd, local_regular_osd, global_gs_stats_osd);	
 			
 		} else if (osd_level == 2) { // minimal extras
-			snprintf(full_osd_string, sizeof(full_osd_string), "%s %s",
-					global_profile_osd, local_regular_osd);	
+			snprintf(full_osd_string, sizeof(full_osd_string), "%s %s %s",
+					global_profile_osd, global_profile_fec_osd, local_regular_osd);	
 			
 		} else if (osd_level == 1){ // only basic regular string
 			snprintf(full_osd_string, sizeof(full_osd_string), "%s",
@@ -921,15 +1158,19 @@ bool value_chooses_profile(int input_value) {
     long currentTime = get_monotonic_time();
     long timeElapsed = currentTime - prevTimeStamp;
 
-    if (previousProfile == 0 && timeElapsed <= hold_fallback_mode_s) {
-        if (verbose_mode) {
-			puts("Holding fallback...");
+	// if it's in fallback, go by fallback time
+    if (previousProfile == 0) {
+		if (timeElapsed <= hold_fallback_mode_s) {
+			if (verbose_mode) {
+				puts("Holding fallback...");
+			}
+			return false;
 		}
-		return false;
-    }
-    if (previousProfile < currentProfile && timeElapsed <= hold_modes_down_s) {
+	}
+	// or if it's a normal profile, go by normal holddown time
+    else if (previousProfile < currentProfile && timeElapsed <= hold_modes_down_s) {
         if (verbose_mode) {
-			puts("Holding mode down...");
+			puts("Too soon to increase link...");
 		}
 		return false;
     }
@@ -961,24 +1202,6 @@ void start_selection(int rssi_score, int snr_score, int recovered) {
 		return;
     }
 
-	// Check for any penalties
-	if (recovered >= fec_rec_alarm && (fec_rec_penalty * recovered) > applied_penalty) {
-		applied_penalty = fec_rec_penalty * recovered;
-		//limit to max penalty using min macro up top
-		applied_penalty = min(applied_penalty, max_fec_rec_penalty);
-		penalty_timestamp = current_time;
-		if (verbose_mode) {
-			puts("fec_rec penalty condition met...");
-		}
-	}
-	// Check penalty expiration
-    if (applied_penalty > 0 && (current_time.tv_sec - penalty_timestamp.tv_sec) > apply_penalty_for_s) {
-        applied_penalty = 0;
-        if (verbose_mode) {
-            puts("fec_rec penalty time is up. Penalty withdrawn");
-        }
-    }
-
 	if (selection_busy) {
         if (verbose_mode) {
 			puts("Selection process busy...");
@@ -991,14 +1214,6 @@ void start_selection(int rssi_score, int snr_score, int recovered) {
 	float combined_value_float = rssi_score * rssi_weight + snr_score * snr_weight;
 	int osd_raw_score = (int)combined_value_float;
 
-	// Deduct penalty if it is active
-	if (applied_penalty > 0) {
-		combined_value_float -= applied_penalty;
-		if (verbose_mode) {
-			printf("Deducting penalty of %d from current link score, new combined value: %.2f\n", applied_penalty, combined_value_float);
-		}
-	}
-
 	// Determine which exp_smoothing_factor to use (up or down)
     float chosen_smoothing_factor = (combined_value_float >= last_value_sent) ? smoothing_factor : smoothing_factor_down;
 
@@ -1007,7 +1222,7 @@ void start_selection(int rssi_score, int snr_score, int recovered) {
 
 	int osd_smoothed_score = (int)smoothed_combined_value;
 	// update score_related osd string
-	sprintf(global_score_related_osd, "og %d, smthd %d", osd_raw_score, osd_smoothed_score);
+	sprintf(global_score_related_osd, "linkQ %d, smthdQ %d", osd_raw_score, osd_smoothed_score);
 
 	// Check if enough time has passed
     long time_diff_ms = (current_time.tv_sec - last_exec_time.tv_sec) * 1000 + (current_time.tv_nsec - last_exec_time.tv_nsec) / 1000000;
@@ -1034,7 +1249,6 @@ void start_selection(int rssi_score, int snr_score, int recovered) {
         if (value_chooses_profile(combined_value)) {
             printf("Profile %d applied.\n", combined_value);
             last_value_sent = combined_value;
-            //smoothed_combined_value = (float)combined_value;  // Update baseline for future comparisons - Should be redundant, as this value already came from that
             last_exec_time = current_time;
         }
     }
@@ -1127,7 +1341,7 @@ void special_command_message(const char *msg) {
                 if (verbose_mode) {
                     printf("Special: Requesting Keyframe for code: %s\n", code);
                 }
-                system(quotedCommand);
+				if (system(quotedCommand) != 0) { printf("Command failed: %s\n", quotedCommand); }
                 last_keyframe_request_time = current_time;
 				total_keyframe_requests++;
             } else {
@@ -1173,8 +1387,7 @@ long get_wlan0_tx_dropped() {
     }
 
     // Skip the first two lines (headers)
-    fgets(line, sizeof(line), fp);
-    fgets(line, sizeof(line), fp);
+    if (fgets(line, sizeof(line), fp) == NULL || fgets(line, sizeof(line), fp) == NULL) { printf("fgets failed\n"); }
 
     // Read each line to find the wlan0 interface
     while (fgets(line, sizeof(line), fp) != NULL) {
@@ -1236,7 +1449,7 @@ void *periodic_tx_dropped(void *arg) {
 			char quotedCommand[BUFFER_SIZE];
 			snprintf(quotedCommand, sizeof(quotedCommand), "\"%s\"", idrCommand);
 					
-			system(quotedCommand);
+			if (system(quotedCommand) != 0) { printf("Command failed: %s\n", quotedCommand); }
 			last_keyframe_request_time = current_time;
 			total_keyframe_requests_xtx++;
 					
@@ -1245,8 +1458,7 @@ void *periodic_tx_dropped(void *arg) {
 			}
         }
 
-        // Sleep for 100ms
-        usleep(100000);  
+        usleep(check_xtx_period_ms * 1000);
     }
 }
 
@@ -1275,18 +1487,20 @@ void *count_messages(void *arg) {
 }
 
 void process_message(const char *msg) {
+    
+	static struct timeval last_fec_call_time = {0};
+    static int first_time = 1;
 
-	// Declare  default local variables
+    // Declare default local variables
     struct timeval tv;
     int transmitted_time = 0;
     int link_value_rssi = 999;
     int link_value_snr = 999;
-	int recovered = 0;
+    int recovered = 0;
     int recovered_otime = 0;
     int rssi1 = -105;
     int snr1 = 0;
-    int rssi3 = -105;
-    int rssi4 = -105;
+    char idr_code[16] = "";
 
     // Copy the input string to avoid modifying the original
     char *msgCopy = strdup(msg);
@@ -1307,8 +1521,8 @@ void process_message(const char *msg) {
                 break;
             case 1:
                 link_value_rssi = atoi(token);
-				break;
-			case 2:
+                break;
+            case 2:
                 link_value_snr = atoi(token);
                 break;
             case 3:
@@ -1324,10 +1538,17 @@ void process_message(const char *msg) {
                 snr1 = atoi(token);
                 break;
             case 7:
-                rssi3 = atoi(token);
+                num_antennas = atoi(token);
                 break;
             case 8:
-                rssi4 = atoi(token);
+                noise_pnlty = atoi(token);
+                break;
+            case 9:
+                fec_change = atoi(token);
+                break;
+            case 10:
+                strncpy(idr_code, token, sizeof(idr_code) - 1);
+                idr_code[sizeof(idr_code) - 1] = '\0';
                 break;
             default:
                 // Ignore extra tokens
@@ -1340,15 +1561,43 @@ void process_message(const char *msg) {
     // Free the duplicated string
     free(msgCopy);
 
-	// Create osd string with gs information
-	sprintf(global_gs_stats_osd, "rssi%d, %d\nsnr%d, %d\nfec%d",
-				rssi1,
-				link_value_rssi,
-				snr1,
-				link_value_snr,
-				recovered);
+    // Request a keyframe if an idr_code is provided
+    if (idr_code[0] != '\0') {
+        char keyframe_request[64];
+        snprintf(keyframe_request, sizeof(keyframe_request), "special:request_keyframe:%s", idr_code);
+        special_command_message(keyframe_request);
+    }
 
-	// Only proceed with time synchronization if it hasn't been set yet
+    // Get the current time
+    struct timeval current_time;
+    gettimeofday(&current_time, NULL);
+
+    // Initialize last_fec_call_time on the first call
+    if (first_time) {
+        last_fec_call_time = current_time;
+        first_time = 0;
+    }
+
+    // Calculate the time difference in milliseconds
+    long elapsed_ms = (current_time.tv_sec - last_fec_call_time.tv_sec) * 1000 +
+                      (current_time.tv_usec - last_fec_call_time.tv_usec) / 1000;
+
+    // Only call manage_fec_and_bitrate if a fec_change has occurred and
+    // at least 1 second has elapsed since the last call
+    if (allow_dynamic_fec && fec_change != prev_fec_change && elapsed_ms >= 1000) {
+        manage_fec_and_bitrate(prevSetFecK, prevSetFecN, prevSetBitrate);
+        last_fec_call_time = current_time;
+        prev_fec_change = fec_change;
+    }
+
+    // Create OSD string with ground station stats information
+	if (num_antennas_drone > 0) {
+		sprintf(global_gs_stats_osd, "rssi%d snr%d ants:vrx%d,vtx%d", rssi1, snr1, num_antennas, num_antennas_drone);
+	} else {
+		sprintf(global_gs_stats_osd, "rssi%d snr%d ants:vrx%d", rssi1, snr1, num_antennas);
+	}
+
+    // Only proceed with time synchronization if it hasn't been set yet
     if (!time_synced) {
         if (transmitted_time > 0) {
             tv.tv_sec = transmitted_time;
@@ -1360,7 +1609,7 @@ void process_message(const char *msg) {
                 perror("Failed to set system time");
             }
         }
-	}
+    }
 
     // Start selection if not paused
     pthread_mutex_lock(&pause_mutex);
@@ -1369,9 +1618,10 @@ void process_message(const char *msg) {
     } else {
         printf("Adaptive mode paused, waiting for resume command...\n");
     }
-        pthread_mutex_unlock(&pause_mutex);
-
+    pthread_mutex_unlock(&pause_mutex);
 }
+
+
 
 
 void print_usage() {
@@ -1468,7 +1718,7 @@ int main(int argc, char *argv[]) {
 	if (get_card_info_from_yaml) {
 		load_from_vtx_info_yaml();
 	}
-	//Display S	and L
+	// Print S and L
 	printf("ldpc_tx: %d\nstbc: %d\n", ldpc_tx, stbc);
 	
 	// Get resolution
@@ -1480,21 +1730,25 @@ int main(int argc, char *argv[]) {
 	
 	total_pixels = x_res * y_res;
 
-	set_osd_font_size = (x_res < 1280) ? 20 :
-						(x_res < 1700) ? 25 :
-						(x_res < 2000) ? 35 :
-						(x_res < 2560) ? 45 : 50;
+	set_osd_font_size = (x_res < 1280) ? ((int)(20 * multiply_font_size_by)) :
+                    (x_res < 1700) ? ((int)(25 * multiply_font_size_by)) :
+                    (x_res < 2000) ? ((int)(35 * multiply_font_size_by)) :
+                    (x_res < 2560) ? ((int)(45 * multiply_font_size_by)) :
+                                    ((int)(50 * multiply_font_size_by));
+
 	
 	//Get fps value from majestic
 	int fps = get_video_fps();
     if (fps >= 0) {
         printf("Video FPS: %d\n", fps);
 		global_fps = fps;
+		if (fps == 0) {
+			limitFPS = 0;
+		}
     } else {
         printf("Failed to retrieve video FPS from majestic.\n");
+		limitFPS = 0;	
     }
-			
-	
     // Check if roi_focus_mode is enabled and call the setup_roi function
     if (roi_focus_mode) {
         if (setup_roi() != 0) {
@@ -1503,6 +1757,12 @@ int main(int argc, char *argv[]) {
             printf("Focus mode regions set in majestic.yaml\n");
         }
     }
+
+	// Start drone antenna monitoring thread
+	pthread_t rssi_thread;
+	if (pthread_create(&rssi_thread, NULL, parse_rssi_thread, NULL)) {
+		fprintf(stderr, "Error creating drone RSSI monitoring thread\n");
+	}
 
     // Start the counting thread
     pthread_t count_thread;
