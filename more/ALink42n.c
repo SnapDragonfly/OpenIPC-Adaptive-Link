@@ -14,7 +14,7 @@
 
 #define BUFFER_SIZE 1024
 #define DEFAULT_PORT 9999
-#define DEFAULT_IP "10.5.0.10"
+#define DEFAULT_IP "10.5.0.2"
 #define CONFIG_FILE "/etc/alink.conf"
 #define PROFILE_FILE "/etc/txprofiles.conf"
 #define MAX_PROFILES 6
@@ -172,122 +172,6 @@ void load_profiles(const char* filename) {
 
     fclose(file);
 }
-
-// Function to setup roi in majestic.yaml based on resolution
-int setup_roi() {
-	
-    // Variables for resolution
-    int x_res, y_res;
-    char resolution[32];
-
-    // Execute system command to get resolution and store it in a file
-    FILE *fp = popen("cli --get .video0.size", "r");
-    if (fp == NULL) {
-        printf("Failed to run command\n");
-        return 1;
-    }
-
-    // Read the output of the command
-    fgets(resolution, sizeof(resolution) - 1, fp);
-    pclose(fp);
-
-    // Parse the resolution in the format <x_res>x<y_res>
-    if (sscanf(resolution, "%dx%d", &x_res, &y_res) != 2) {
-        printf("Failed to parse resolution\n");
-        return 1;
-    }
-
-    // Round x_res and y_res to nearest multiples of 32
-    int rounded_x_res = floor(x_res / 32) * 32;
-    int rounded_y_res = floor(y_res / 32) * 32;
-
-    // ROI calculation with additional condition
-    int roi_height, start_roi_y;
-    if (rounded_y_res != y_res) {
-        roi_height = rounded_y_res - 32;
-        start_roi_y = 32;
-    } else {
-        roi_height = rounded_y_res;
-        start_roi_y = y_res - rounded_y_res;
-    }
-
-    // Make rois 32 lower for clear stats, make total roi 32 less
-    roi_height = roi_height - 32;
-    start_roi_y = start_roi_y + 32;
-
-    // Calculate edge_roi_width and next_roi_width as multiples of 32
-    int edge_roi_width = floor(rounded_x_res / 8 / 32) * 32;
-    int next_roi_width = (floor(rounded_x_res / 8 / 32) * 32) + 32;
-
-    int coord0 = 0;
-    int coord1 = edge_roi_width;
-    int coord2 = x_res - edge_roi_width - next_roi_width;
-    int coord3 = x_res - edge_roi_width;
-
-    // Format ROI definition as a string
-    char roi_define[256];
-    snprintf(roi_define, sizeof(roi_define), "%dx%dx%dx%d,%dx%dx%dx%d,%dx%dx%dx%d,%dx%dx%dx%d",
-             coord0, start_roi_y, edge_roi_width, roi_height,
-             coord1, start_roi_y, next_roi_width, roi_height,
-             coord2, start_roi_y, next_roi_width, roi_height,
-             coord3, start_roi_y, edge_roi_width, roi_height);
-
-    // Prepare the command to set ROI
-    char command[512];
-    snprintf(command, sizeof(command), "cli --set .fpv.roiRect %s", roi_define);
-
-    // Check if .fpv.enabled is set
-    char enabled_status[16];
-    fp = popen("cli --get .fpv.enabled", "r");
-    if (fp == NULL) {
-        printf("Failed to run command\n");
-        return 1;
-    }
-
-    fgets(enabled_status, sizeof(enabled_status) - 1, fp);
-    pclose(fp);
-
-    // Trim newline character
-    enabled_status[strcspn(enabled_status, "\n")] = 0;
-
-    // Check if enabled_status is "true" or "false"
-    if (strcmp(enabled_status, "true") != 0 && strcmp(enabled_status, "false") != 0) {
-        system("cli --set .fpv.enabled true");
-    }
-
-    // Run the command to set ROI
-    system(command);
-
-    // Check if .fpv.roiQp is set correctly
-    char roi_qp_status[32];
-    fp = popen("cli --get .fpv.roiQp", "r");
-    if (fp == NULL) {
-        printf("Failed to run command\n");
-        return 1;
-    }
-
-    fgets(roi_qp_status, sizeof(roi_qp_status) - 1, fp);
-    pclose(fp);
-
-    // Trim newline character
-    roi_qp_status[strcspn(roi_qp_status, "\n")] = 0;
-
-    // Check for four integers separated by commas
-    int num_count = 0;
-    char *token = strtok(roi_qp_status, ",");
-    while (token != NULL) {
-        num_count++;
-        token = strtok(NULL, ",");
-    }
-
-    if (num_count != 4) {
-        system("cli --set .fpv.roiQp 0,0,0,0");
-    }
-
-    return 0;
-}
-
-
 
 
 // Get the profile based on input value
@@ -453,12 +337,12 @@ void apply_profile(Profile* profile) {
 	
 }
 
-bool value_chooses_profile(int input_value) {
+void value_chooses_profile(int input_value) {
     // Get the appropriate profile based on input
     Profile* selectedProfile = get_profile(input_value);
     if (selectedProfile == NULL) {
         printf("No matching profile found for input: %d\n", input_value);
-		return false;
+		return;
     }
 
     // Find the index of the selected profile
@@ -473,7 +357,7 @@ bool value_chooses_profile(int input_value) {
     // If the previous profile is the same, do not apply changes
     if (previousProfile == currentProfile) {
         printf("No change: Link value is within same profile.\n");
-		return false;
+		return;
     }
 
     // Check if a change is needed based on time constraints
@@ -481,10 +365,10 @@ bool value_chooses_profile(int input_value) {
     long timeElapsed = currentTime - prevTimeStamp;
 
     if (previousProfile == 0 && timeElapsed <= hold_fallback_mode_s) {
-        return false;
+        return;
     }
     if ((currentProfile - previousProfile == 1) && timeElapsed <= hold_modes_down_s) {
-        return false;
+        return;
     }
 
     // Apply the selected profile
@@ -492,75 +376,67 @@ bool value_chooses_profile(int input_value) {
 	// Update previousProfile 
     previousProfile = currentProfile;
 	prevTimeStamp = currentTime;
-	return true;
 	
 }
 
 void start_selection(int rssi_score, int snr_score) {
-    if (selection_busy) {
-        return;
-    }
-    selection_busy = true;
+	
+	if (selection_busy) {
+		return;
+	}
+	selection_busy = true;
+	
+	int value;
+	struct timespec current_time;
+	clock_gettime(CLOCK_MONOTONIC, &current_time);  // Use CLOCK_MONOTONIC
 
-    struct timespec current_time;
-    clock_gettime(CLOCK_MONOTONIC, &current_time);
-
-    // Shortcut for fallback profile 999
-    if (rssi_score == 999) {    
-        if (value_chooses_profile(999)) {
-            printf("Applied.\n");
-            last_value_sent = 999;
-            baseline_value = 999;
-            last_exec_time = current_time;
-        } else {
-            printf("Not applied.\n");
-        }
-        selection_busy = false;
-        return;
-    }
-
-    // Check if enough time has passed before doing further calculations
     long time_diff_ms = (current_time.tv_sec - last_exec_time.tv_sec) * 1000 +
-                        (current_time.tv_nsec - last_exec_time.tv_nsec) / 1000000;
+                    (current_time.tv_nsec - last_exec_time.tv_nsec) / 1000000;
 
-    if (time_diff_ms < min_between_changes_ms) {
-        printf("Skipping profile load: time_diff_ms=%ldms - too soon (min %dms required)\n", 
-               time_diff_ms, min_between_changes_ms);
-        selection_busy = false;
-        return;
-    }
+	if (rssi_score == 999) {	
+		//Shortcut to fallback
+		value_chooses_profile(999);
+		last_value_sent = 999;
+		baseline_value = 999;
+		last_exec_time = current_time;
+		selection_busy = false;
+		return;
+		
+	} else {
+		// Combine rssi and snr by weight
+		float w_rssi = rssi_weight;
+		float w_snr = snr_weight;
+		int combined_value = floor(rssi_score * w_rssi + snr_score * w_snr);
+		
+		if (combined_value < 1000) {
+			combined_value = 1000;
+		}
+		if (combined_value > 2000) {
+			combined_value = 2000;
+		}
+		value = combined_value;		
+	}
 
-    // Combine rssi and snr by weight
-    float w_rssi = rssi_weight;
-    float w_snr = snr_weight;
-    int combined_value = floor(rssi_score * w_rssi + snr_score * w_snr);
+	float percent_change = fabs((float)(value - baseline_value) / baseline_value) * 100;
+	if (percent_change >= hysteresis_percent) {
+		// Apply profile change since the difference is significant
+		if (time_diff_ms >= min_between_changes_ms) {
+			printf("Qualified to request profile: %d is > %d percent different\n", value, hysteresis_percent);
+			value_chooses_profile(value);
+			last_value_sent = value;
+			baseline_value = value;
+			last_exec_time = current_time;
+		} else {
+			printf("Skipping profile load: value=%d, time_diff_ms=%ldms - too soon (min %dms required)\n", 
+				value, time_diff_ms, min_between_changes_ms);		   
+		}
+	} //else {
+		// No significant change, keep the same profile
+		//printf("No significant change: %.2f%% (threshold: 15%%)\n", percent_change);
+	//}
 
-    if (combined_value < 1000) {
-        combined_value = 1000;
-    }
-    if (combined_value > 2000) {
-        combined_value = 2000;
-    }
-
-    // Calculate percentage change from baseline value
-    float percent_change = fabs((float)(combined_value - baseline_value) / baseline_value) * 100;
-
-    // Check if the change exceeds hysteresis threshold
-    if (percent_change >= hysteresis_percent) {
-		printf("Qualified to request profile: %d is > %d%% different (%.2f%%)\n", combined_value, hysteresis_percent, percent_change);
-
-        // Request profile, check if applied
-        if (value_chooses_profile(combined_value)) {
-            printf("Profile %d applied.\n", combined_value);
-            last_value_sent = combined_value;
-            baseline_value = combined_value;
-            last_exec_time = current_time;
-        } 
-    } 
-
-    selection_busy = false;
+	selection_busy = false;
 }
-
 
 
 void special_command_message(const char *msg) {
@@ -751,8 +627,7 @@ int main(int argc, char *argv[]) {
     load_config(CONFIG_FILE);
 	// Load profiles from profile file
     load_profiles(PROFILE_FILE);
-
-	
+		
 	int sockfd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
@@ -777,7 +652,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
-	
+
     // Create UDP socket
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("Socket creation failed");
@@ -800,16 +675,6 @@ int main(int argc, char *argv[]) {
    
 	printf("Listening on UDP port %d, IP: %s...\n", port, ip);
     
-	
-	// Check if roi_focus_mode is enabled and call the setup_roi function
-	if (roi_focus_mode) {
-		if (setup_roi() != 0) {
-			printf("Failed to set up focus mode regions based on majestic resolution. You may have to do it manually.\n");
-		} else {
-			printf("Focus mode regions set in majestic.yaml\n");
-		}
-	}
-	
 
     // Prepare counting thread
 	pthread_t count_thread;

@@ -11,10 +11,12 @@ UDP_PORT=9999
 LOG_INTERVAL=100
 WFBGS_CFG=/etc/wifibroadcast.cfg
 WFBGS_CFG2=/home/radxa/gs/wfb.sh
+WFBGS_CFG3=/gs/wfb.sh
+
 
 # Variables for repository
-REPO_OWNER="sickgreg"
-REPO_NAME="OpenIPC-Adaptive-Link"
+REPO_OWNER="OpenIPC"
+REPO_NAME="adaptive-link"
 
 # Function to fetch the latest release asset URL
 github_asset_url() {
@@ -64,24 +66,28 @@ update_log_interval() {
 		fi
 	fi
 	
+	if [ -f "$WFBGS_CFG3" ]; then
+		# If the file exists, update the log_interval here too (CC's GS)
+		if grep -q "log_interval" "$WFBGS_CFG3"; then
+			sed -i 's/log_interval.*/log_interval = '${LOG_INTERVAL}'/' "$WFBGS_CFG3"
+		else
+			sed -i '/\[common\]/a log_interval = '${LOG_INTERVAL}'' "$WFBGS_CFG3"
+		fi
+	fi
+	
 }
 
 # Ground Station setup
 gs_setup() {
 	FILE_NAME=alink_gs
-	FILE=/usr/bin/$FILE_NAME
-# Check if /config directory exists
-if [ -d "/config" ]; then
-  # If /config exists, use it
-  FILE_CONF="/config/$FILE_NAME.conf"
-# Check if /home/radxa directory exists
-elif [ -d "/home/radxa" ]; then
-  # If /home/radxa exists, use it
-  FILE_CONF="/home/radxa/$FILE_NAME.conf"
-else
-  # If neither /config nor /home/radxa exist, use /etc
-  FILE_CONF="/etc/$FILE_NAME.conf"
-fi
+	FILE=/usr/local/bin/$FILE_NAME
+	FILE_CONF="/etc/alink_gs.conf"
+
+	# If /config exists, create or update the symlink so /etc/alink_gs.conf points to /config/alink_gs.conf
+	if [ -d "/config" ]; then
+		ln -sf /config/alink_gs.conf $FILE_CONF
+	fi
+	
 	PATH_SERVICE=/etc/systemd/system/$FILE_NAME.service
 
 	case "$1" in
@@ -110,6 +116,8 @@ EOF
 
 			# Start service for testing
 			echo "Starting Adaptive Link temporarily for testing..."
+			update_log_interval
+			
 			$FILE --config $FILE_CONF &
 			sleep 5 && kill $!
 
