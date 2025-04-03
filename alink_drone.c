@@ -1592,9 +1592,9 @@ void process_message(const char *msg) {
 
     // Create OSD string with ground station stats information
 	if (num_antennas_drone > 0) {
-		sprintf(global_gs_stats_osd, "rssi%d snr%d ants:vrx%d,vtx%d", rssi1, snr1, num_antennas, num_antennas_drone);
+		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d ants:vrx%d,vtx%d", rssi1, snr1, recovered, num_antennas, num_antennas_drone);
 	} else {
-		sprintf(global_gs_stats_osd, "rssi%d snr%d ants:vrx%d", rssi1, snr1, num_antennas);
+		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d ants:vrx%d", rssi1, snr1, recovered, num_antennas);
 	}
 
     // Only proceed with time synchronization if it hasn't been set yet
