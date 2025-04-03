@@ -265,27 +265,36 @@ def process_data_line(line):
 def listen_for_data(sock):
     global waiting_for_video_printed
     waiting_for_video_printed = False
-    with sock.makefile() as f:
-        for line in f:
-            if not line:
-                break
-            data = process_data_line(line)
-            if data is None:
-                continue
-            if data.get("type") == "rx" and data.get("id") == "video rx":
-                handle_video_rx_stats(data)
-            else:
-                global receiving_video
-                receiving_video = False
+    # Wrap the file object usage in a try block to ensure proper cleanup
+    try:
+        with sock.makefile() as f:
+            for line in f:
+                if not line:
+                    break
+                data = process_data_line(line)
+                if data is None:
+                    continue
+                if data.get("type") == "rx" and data.get("id") == "video rx":
+                    handle_video_rx_stats(data)
+                else:
+                    global receiving_video
+                    receiving_video = False
+    except Exception as e:
+        if verbose_mode:
+            print(f"Error processing data: {e}")
 
 def connect_to_wfb_stats():
     # Use the JSON data settings (HOST and PORT) from config
     while True:
+        sock = None
         try:
             sock = connect_to_server(HOST, PORT)
             listen_for_data(sock)
         except (socket.error, ConnectionRefusedError) as e:
             print(f"\n! Check VRX adapter(s)...\nNo connection to wfb-ng stats\n{e}\nRetrying in 3 seconds...")
+        finally:
+            if sock:
+                sock.close()
             time.sleep(3)
 
 if __name__ == "__main__":
