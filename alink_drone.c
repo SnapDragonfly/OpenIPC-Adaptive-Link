@@ -1497,7 +1497,7 @@ void process_message(const char *msg) {
     int link_value_rssi = 999;
     int link_value_snr = 999;
     int recovered = 0;
-    int recovered_otime = 0;
+    int lost_packets = 0;
     int rssi1 = -105;
     int snr1 = 0;
     char idr_code[16] = "";
@@ -1529,7 +1529,7 @@ void process_message(const char *msg) {
                 recovered = atoi(token);
                 break;
             case 4:
-                recovered_otime = atoi(token);
+                lost_packets = atoi(token);
                 break;
             case 5:
                 rssi1 = atoi(token);
@@ -1592,9 +1592,11 @@ void process_message(const char *msg) {
 
     // Create OSD string with ground station stats information
 	if (num_antennas_drone > 0) {
-		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d ants:vrx%d,vtx%d", rssi1, snr1, recovered, num_antennas, num_antennas_drone);
+		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d lost%d ants:vrx%d,vtx%d", 
+                                      rssi1, snr1, recovered, lost_packets, num_antennas, num_antennas_drone);
 	} else {
-		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d ants:vrx%d", rssi1, snr1, recovered, num_antennas);
+		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d lost%d ants:vrx%d", 
+                                      rssi1, snr1, recovered, lost_packets, num_antennas);
 	}
 
     // Only proceed with time synchronization if it hasn't been set yet
