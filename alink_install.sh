@@ -134,7 +134,10 @@ EOF
 			 systemctl restart wifibroadcast.service
 			 systemctl enable $FILE_NAME.service
 			 systemctl start $FILE_NAME.service
-			echo_green "Adaptive Link installed successfully."
+    			echo_green "Adaptive Link installed successfully."
+       			if [ -d "/config" ]; then
+				ln -sf /config/alink_gs.conf $FILE_CONF
+			fi
 			;;
 		remove)
 	
