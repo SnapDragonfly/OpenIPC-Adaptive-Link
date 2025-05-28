@@ -1,18 +1,19 @@
-#include <stdio.h>              // For printf, perror
-#include <stdlib.h>             // For malloc, free, atoi
-#include <string.h>             // For strtok, strdup
-#include <unistd.h>             // For usleep
-#include <pthread.h>            // For pthread functions
-#include <sys/socket.h>         // For socket functions
-#include <netinet/in.h>         // For sockaddr_in
-#include <arpa/inet.h>          // For inet_pton
-#include <stdbool.h>            // For bool, true, false
-#include <sys/time.h>           // For timeval, settimeofday
-#include <sys/wait.h>           // For waitpid
-#include <time.h>               // For timespec, clock_gettime
+#include <stdio.h>  
+#include <stdlib.h>  
+#include <string.h>  
+#include <unistd.h>   
+#include <pthread.h>   
+#include <sys/socket.h>  
+#include <netinet/in.h>  
+#include <arpa/inet.h>  
+#include <stdbool.h>    
+#include <sys/time.h>  
+#include <sys/wait.h>  
+#include <time.h>    
 #include <math.h>
 #include <ctype.h>
 #include <limits.h>
+#include <sys/un.h> 
 
 #define MAX_COMMAND_SIZE 256
 #define BUFFER_SIZE 1024
@@ -24,6 +25,9 @@
 #define DEFAULT_PACE_EXEC_MS 50
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
+
+
+
 
 // Profile struct
 typedef struct {
@@ -42,6 +46,7 @@ typedef struct {
 } Profile;
 
 Profile profiles[MAX_PROFILES];
+Profile* selectedProfile = NULL;
 
 // osd2udp struct
 typedef struct {
@@ -59,8 +64,6 @@ char global_extra_stats_osd[256] = "initializing...";
 char global_score_related_osd[64] = "initializing...";
 
 int osd_level = 4;
-
-
 int x_res = 1920;
 int y_res = 1080;
 int global_fps = 120;
@@ -68,13 +71,12 @@ int total_pixels = 2073600;
 int set_osd_font_size = 20;
 int set_osd_colour = 7;
 float multiply_font_size_by = 0.5;
-
+char camera_bin[64] = "";
 int num_antennas = 0;
 int num_antennas_drone = 0;
 int noise_pnlty = 0;
 int fec_change = 0;
 int prev_fec_change = 0;
-
 int prevWfbPower = -1;
 float prevSetGop = -1.0;
 int prevBandwidth = -20;
@@ -99,7 +101,10 @@ long pace_exec = DEFAULT_PACE_EXEC_MS * 1000L;
 int currentProfile = -1;
 int previousProfile = -2;
 long prevTimeStamp = 0;
+
 bool allow_set_power = 1;
+bool use_0_to_10_txpower = 0;
+int power_level_0_to_10 = 0;
 float rssi_weight = 0.5;
 float snr_weight = 0.5;
 int hold_fallback_mode_s = 2;
@@ -108,6 +113,8 @@ int min_between_changes_ms = 100;
 int request_keyframe_interval_ms = 50;
 bool allow_request_keyframe = 1;
 bool allow_rq_kf_by_tx_d = 1;
+bool allow_xtx_reduce_bitrate = 1;
+float xtx_reduce_bitrate_factor = 0.5;
 int check_xtx_period_ms = 500;
 int hysteresis_percent = 15;
 int hysteresis_percent_down = 5;
@@ -120,6 +127,9 @@ bool get_card_info_from_yaml = false;
 
 bool allow_dynamic_fec = 1;
 bool fec_k_adjust = 0;
+bool spike_fix_dynamic_fec = 1;
+
+int limit_max_score_to = 2000;
 
 int fallback_ms = 1000;
 bool idr_every_change = false;
@@ -129,45 +139,210 @@ char fpsCommandTemplate[150], powerCommandTemplate[100], qpDeltaCommandTemplate[
 bool verbose_mode = false;
 bool selection_busy = false;
 bool initialized_by_first_message = false;
-int message_count = 0;      // Global variable for message count
-bool paused = false;        // Global variable for pause state
-bool time_synced = false;   // Global flag to indicate if time has been synced
+int message_count = 0; 
+bool paused = false;
+bool time_synced = false;
 int last_value_sent = 100;
 struct timespec last_exec_time;
-struct timespec last_keyframe_request_time;	// Last keyframe request command
-pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;  // Mutex for message count
-pthread_mutex_t pause_mutex = PTHREAD_MUTEX_INITIALIZER;  // Mutex for pause state
+struct timespec last_keyframe_request_time;
+pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t pause_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#define MAX_CODES 5       // Maximum number of unique keyframe requests to track
-#define CODE_LENGTH 8     // Max length of each unique code
-#define EXPIRY_TIME_MS 1000 // Code expiry time in milliseconds
+#define MAX_CODES 5       // Maximum unique idr rq to track
+#define CODE_LENGTH 8 
+#define EXPIRY_TIME_MS 1000
 
 int total_keyframe_requests = 0;
 int total_keyframe_requests_xtx = 0;
 long global_total_tx_dropped = 0;
-
+bool bitrate_reduced = false;
 
 volatile int weak_antenna_detected = 0;
+
+// ─── Shared protocol definitions ───
+// for comms from air_man
+enum {
+    CMD_SET_POWER      = 1,
+    CMD_GET_STATUS     = 2,
+	CMD_ANTENNA_STATS  = 3,
+    CMD_GET			   = 4,
+    CMD_SET    		   = 5,
+
+    // … add more as you need
+    CMD_STATUS_REPLY   = 0x8000    // OR’d into cmd for replies
+};
+
+struct __attribute__((packed)) alink_msg_hdr {
+    uint16_t cmd;   // one of CMD_*
+    uint16_t len;   // length of payload in bytes
+};
+
+// ────────────────────────────────────
+
+#define ALINK_CMD_SOCKET_PATH  "/tmp/alink_cmd.sock"
+
+pthread_mutex_t alink_tx_power_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define WFB_YAML "/etc/wfb.yaml"
+#define WIFI_ADAPTERS_YAML "/etc/wlan_adapters.yaml"
+#define MAX_OUTPUT         512
+#define MAX_CMD           1024
+#define RAW_BUF          2048
+#define MCS_COUNT           8
+#define POWER_LEVELS       11
+
+// global table
+int tx_power_table[MCS_COUNT][POWER_LEVELS];
+
+// strip trailing newline
+static void strip_newline(char *s) {
+    size_t l = strlen(s);
+    if (l > 0 && s[l-1] == '\n') s[l-1] = '\0';
+}
+
+void load_tx_power_table(void) {
+    char adapter[MAX_OUTPUT];
+    char cmd[MAX_CMD];
+    char raw[RAW_BUF];
+    char tmp[MAX_OUTPUT];
+    FILE *fp;
+
+    // 1) get adapter name
+    snprintf(cmd, sizeof(cmd),
+             "yaml-cli -i %s -g .wireless.wlan_adapter",
+             WFB_YAML);
+    fp = popen(cmd, "r");
+    if (!fp || !fgets(adapter, sizeof(adapter), fp)) {
+        fprintf(stderr, "Error: Could not detect WiFi adapter.\n");
+        if (fp) pclose(fp);
+        return;
+    }
+    pclose(fp);
+    strip_newline(adapter);
+    printf("\n\nUsing wlan adapter: %s\n\n", adapter);
+
+    // 2) for each MCS, fetch & parse
+    for (int mcs = 0; mcs < MCS_COUNT; ++mcs) {
+        // zero out in case of partial parse
+        memset(tx_power_table[mcs], 0,
+               sizeof tx_power_table[mcs]);
+
+        // build command (remove brackets only)
+        snprintf(cmd, sizeof(cmd),
+                 "yaml-cli -i %s -g \".profiles.%s.tx_power.mcs%d\" | sed 's/[][]//g'",
+                 WIFI_ADAPTERS_YAML, adapter, mcs);
+
+        fp = popen(cmd, "r");
+        if (!fp) {
+            fprintf(stderr, "Failed to run yaml-cli for MCS%d\n", mcs);
+            continue;
+        }
+
+        // accumulate all lines into raw[]
+        raw[0] = '\0';
+        while (fgets(tmp, sizeof(tmp), fp)) {
+            strip_newline(tmp);
+            strncat(raw, tmp, sizeof(raw) - strlen(raw) - 1);
+        }
+        pclose(fp);
+
+        // strip any stray quotes
+        for (char *p = raw; *p; ++p) {
+            if (*p == '"') *p = ' ';
+        }
+
+        // tokenize on commas or whitespace, remember last value
+        int idx = 0;
+        int last_value = 0;
+        char *tok = strtok(raw, ", \t");
+        while (tok && idx < POWER_LEVELS) {
+            while (*tok == ' ') tok++;  // skip leading spaces
+            last_value = atoi(tok);
+            tx_power_table[mcs][idx++] = last_value;
+            tok = strtok(NULL, ", \t");
+        }
+
+        // pad remaining slots with last_value
+        for (; idx < POWER_LEVELS; idx++) {
+            tx_power_table[mcs][idx] = last_value;
+        }
+        
+    }
+}
+
+
+void print_tx_power_table(void) {
+    printf("TX Power Table (MCS x Power Index):\n");
+
+    // 1) 8-space indent to match "MCS0  : "
+    printf("        ");
+    // 2) Print headers in a 5-wide field + space (total 6 chars each)
+    for (int i = 0; i < POWER_LEVELS; i++) {
+        char hdr[5];
+        snprintf(hdr, sizeof(hdr), "P%02d", i);
+        printf("%5s ", hdr);
+    }
+    printf("\n");
+
+    // 3) Print each row the same way: prefix + 5-wide numbers + space
+    for (int m = 0; m < MCS_COUNT; m++) {
+        printf("MCS%-3d: ", m);
+        for (int p = 0; p < POWER_LEVELS; p++) {
+            printf("%5d ", tx_power_table[m][p]);
+        }
+        printf("\n");
+    }
+}
+
+//  Shared RSSI (drone antenna) Queue (thread-safe)
+#define MAX_RSSI_QUEUE 64
+#define MAX_RSSI_LINE 256
+
+char rssi_line_queue[MAX_RSSI_QUEUE][MAX_RSSI_LINE];
+int rssi_q_head = 0;
+int rssi_q_tail = 0;
+pthread_mutex_t rssi_q_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int enqueue_rssi_line(const char *line) {
+    pthread_mutex_lock(&rssi_q_lock);
+    int next_tail = (rssi_q_tail + 1) % MAX_RSSI_QUEUE;
+    if (next_tail == rssi_q_head) {
+        pthread_mutex_unlock(&rssi_q_lock);
+        return -1; // Queue full
+    }
+    strncpy(rssi_line_queue[rssi_q_tail], line, MAX_RSSI_LINE - 1);
+    rssi_line_queue[rssi_q_tail][MAX_RSSI_LINE - 1] = '\0';
+    rssi_q_tail = next_tail;
+    pthread_mutex_unlock(&rssi_q_lock);
+    return 0;
+}
+
+int dequeue_rssi_line(char *line_out) {
+    pthread_mutex_lock(&rssi_q_lock);
+    if (rssi_q_head == rssi_q_tail) {
+        pthread_mutex_unlock(&rssi_q_lock);
+        return 0; // Queue empty
+    }
+    strncpy(line_out, rssi_line_queue[rssi_q_head], MAX_RSSI_LINE);
+    rssi_q_head = (rssi_q_head + 1) % MAX_RSSI_QUEUE;
+    pthread_mutex_unlock(&rssi_q_lock);
+    return 1;
+}
+
 // monitor drone antenna rssi
 void *parse_rssi_thread(void *arg) {
-    const char *FIFO_PATH = "/tmp/wfb_rx.log";
-    const int MAX_LINE = 512;
-    const int NUM_ANTENNAS = 4; //max
-    const int HISTORY_SIZE = 20;
-    const int RSSI_THRESHOLD = 20;  // to trigger flag
+    (void)arg;  // Unused
 
-    FILE *fp = fopen(FIFO_PATH, "r");
-    if (!fp) {
-        perror("Failed to open FIFO, not tracking local wfb_rx tunnel stats\nIf you want to track these, add the logic to your wifibroadcast script");
-        pthread_exit(NULL);
-    }
+    const int MAX_LINE = 512;
+    const int NUM_ANTENNAS = 4;
+    const int HISTORY_SIZE = 20;
+    const int RSSI_THRESHOLD = 20;
 
     int rssi_history[NUM_ANTENNAS][HISTORY_SIZE];
     int rssi_index[NUM_ANTENNAS];
     int rssi_avg[NUM_ANTENNAS];
     int rssi_count[NUM_ANTENNAS];
 
-    // Initialize arrays
     for (int i = 0; i < NUM_ANTENNAS; i++) {
         rssi_index[i] = 0;
         rssi_avg[i] = 0;
@@ -178,34 +353,44 @@ void *parse_rssi_thread(void *arg) {
     }
 
     char line[MAX_LINE];
-    while (fgets(line, sizeof(line), fp)) {
+    while (1) {
+        if (!dequeue_rssi_line(line)) {
+            usleep(10000); // Sleep 10ms if no data
+            continue;
+        }
+		
+		if (verbose_mode && strstr(line, "RX_ANT")) {
+			printf("RX_ANT received: %s\n", line);
+		}
+
         if (strstr(line, "RX_ANT")) {
             char freq_mcs_band[64], colon_values[128];
             int antenna, timestamp;
-            
+
             if (sscanf(line, "%d RX_ANT %63s %d %127[^\n]", &timestamp, freq_mcs_band, &antenna, colon_values) == 4) {
-                if (antenna < 0 || antenna >= NUM_ANTENNAS) continue; // Ignore invalid antennas
-				if (antenna >= num_antennas_drone) {
-					num_antennas_drone = antenna + 1;  // Update global
-				}
-                
+                if (antenna < 0 || antenna >= NUM_ANTENNAS) continue;
+                if (antenna >= num_antennas_drone) {
+                    num_antennas_drone = antenna + 1;
+                }
+
+                // Parse the 3rd colon-separated value (RSSI)
                 char *token;
                 int token_count = 0, rssi = 0;
                 token = strtok(colon_values, ":");
                 while (token) {
-                    if (++token_count == 3) {  // RSSI is the third field
+                    if (++token_count == 3) {
                         rssi = atoi(token);
                         break;
                     }
                     token = strtok(NULL, ":");
                 }
 
-                // Store RSSI in history buffer
+                // Store RSSI in history
                 rssi_history[antenna][rssi_index[antenna] % HISTORY_SIZE] = rssi;
                 rssi_index[antenna]++;
                 rssi_count[antenna]++;
 
-                // Compute moving average
+                // Calculate moving average
                 int sum = 0, count = rssi_count[antenna] < HISTORY_SIZE ? rssi_count[antenna] : HISTORY_SIZE;
                 for (int i = 0; i < count; i++) {
                     sum += rssi_history[antenna][i];
@@ -220,18 +405,14 @@ void *parse_rssi_thread(void *arg) {
                         if (rssi_avg[i] > max_rssi) max_rssi = rssi_avg[i];
                     }
                 }
-                if (max_rssi - min_rssi >= RSSI_THRESHOLD) {
-                    weak_antenna_detected = 1;
-                } else {
-                    weak_antenna_detected = 0;
-                }
+                weak_antenna_detected = (max_rssi - min_rssi >= RSSI_THRESHOLD) ? 1 : 0;
             }
         }
     }
 
-    fclose(fp);
     pthread_exit(NULL);
 }
+
 
 void error_to_osd(const char *message) {
     const char *prefix = "&L50&F30 ";
@@ -252,6 +433,15 @@ void error_to_osd(const char *message) {
     fclose(file);
 }
 
+void adjust_font_size() {	
+	total_pixels = x_res * y_res;
+
+	set_osd_font_size = (x_res < 1280) ? ((int)(20 * multiply_font_size_by)) :
+                    (x_res < 1700) ? ((int)(25 * multiply_font_size_by)) :
+                    (x_res < 2000) ? ((int)(35 * multiply_font_size_by)) :
+                    (x_res < 2560) ? ((int)(45 * multiply_font_size_by)) :
+                                    ((int)(50 * multiply_font_size_by));
+}
 
 // Struct to store each keyframe request code and its timestamp
 typedef struct {
@@ -270,12 +460,50 @@ long get_monotonic_time() {
     return ts.tv_sec;
 }
 
+int get_camera_bin() {
+    char sensor_config[256];
+    
+    // Run the system command to get the sensor config file path
+    FILE *fp = popen("cli -g .isp.sensorConfig", "r");
+    if (fp == NULL) {
+        printf("Failed to run sensorConfig command\n");
+        return 1;
+    }
+
+    if (fgets(sensor_config, sizeof(sensor_config) - 1, fp) == NULL) {
+        printf("fgets failed\n");
+        pclose(fp);
+        return 1;
+    }
+
+    pclose(fp);
+
+    // Remove trailing newline, if any
+    sensor_config[strcspn(sensor_config, "\n")] = '\0';
+
+    // Extract just the filename from the path
+    const char *filename = strrchr(sensor_config, '/');
+    if (filename) {
+        // Skip the '/' character
+        strncpy(camera_bin, filename + 1, sizeof(camera_bin) - 1);
+    } else {
+        // No '/' found, copy the whole string
+        strncpy(camera_bin, sensor_config, sizeof(camera_bin) - 1);
+    }
+
+    // Ensure null-termination
+    camera_bin[sizeof(camera_bin) - 1] = '\0';
+
+    printf("Camera Bin: %s\n", camera_bin);
+    return 0;
+}
+
 int get_resolution() {
 	
 	char resolution[32];
 
     // Execute system command to get resolution
-    FILE *fp = popen("cli --get .video0.size", "r");
+    FILE *fp = popen("cli -g .video0.size", "r");
     if (fp == NULL) {
         printf("Failed to run get resolution command\n");
         return 1;
@@ -299,6 +527,15 @@ int get_resolution() {
 
 }
 
+// Get resolution but default to 1080p if failed
+void get_resolution_with_default() {
+	if (get_resolution() != 0) {
+					printf("Failed to get resolution. Assuming 1920x1080\n");
+					x_res = 1920;
+					y_res = 1080;
+	}
+}
+
 void load_config(const char* filename) {
     FILE *file = fopen(filename, "r");
     if (!file) {
@@ -320,7 +557,14 @@ void load_config(const char* filename) {
         if (key && value) {
             if (strcmp(key, "allow_set_power") == 0) {
                 allow_set_power = atoi(value);
-            } else if (strcmp(key, "rssi_weight") == 0) {
+			} else if (strcmp(key, "use_0_to_10_txpower") == 0) {
+                use_0_to_10_txpower = atoi(value);
+
+			} else if (strcmp(key, "power_level_0_to_10") == 0) {
+                power_level_0_to_10 = atoi(value);
+
+				
+			} else if (strcmp(key, "rssi_weight") == 0) {
                 rssi_weight = atof(value);
             } else if (strcmp(key, "snr_weight") == 0) {
                 snr_weight = atof(value);
@@ -346,7 +590,9 @@ void load_config(const char* filename) {
 			
 			} else if (strcmp(key, "fec_k_adjust") == 0) {
                 fec_k_adjust = atoi(value);
-				
+			} else if (strcmp(key, "spike_fix_dynamic_fec") == 0) {
+                spike_fix_dynamic_fec = atoi(value);
+							
             } else if (strcmp(key, "allow_rq_kf_by_tx_d") == 0) {
                 allow_rq_kf_by_tx_d = atoi(value);
             } else if (strcmp(key, "hysteresis_percent") == 0) {
@@ -362,7 +608,12 @@ void load_config(const char* filename) {
             
             } else if (strcmp(key, "allow_spike_fix_fps") == 0) {
                 limitFPS = atoi(value);
-         
+			
+			} else if (strcmp(key, "allow_xtx_reduce_bitrate") == 0) {
+                allow_xtx_reduce_bitrate = atoi(value);
+			} else if (strcmp(key, "xtx_reduce_bitrate_factor") == 0) {
+                xtx_reduce_bitrate_factor = atof(value);
+			         
             } else if (strcmp(key, "osd_level") == 0) {
                 osd_level = atoi(value);
             } else if (strcmp(key, "multiply_font_size_by") == 0) {
@@ -546,7 +797,7 @@ void determine_tx_power_equation() {
 
 // Function to read fps from majestic.yaml
 int get_video_fps() {
-    char command[] = "cli --get .video0.fps";
+    char command[] = "cli -g .video0.fps";
     char buffer[128]; // Buffer to store command output
     FILE *pipe;
     int fps = 0;
@@ -554,7 +805,7 @@ int get_video_fps() {
     // Open a pipe to execute the command
     pipe = popen(command, "r");
     if (pipe == NULL) {
-        fprintf(stderr, "Failed to run cli --get .video0.fps\n");
+        fprintf(stderr, "Failed to run cli -g .video0.fps\n");
         return -1; // Return an error code
     }
 
@@ -613,11 +864,11 @@ int setup_roi() {
 
     // Prepare the command to set ROI
     char command[512];
-    snprintf(command, sizeof(command), "cli --set .fpv.roiRect %s", roi_define);
+    snprintf(command, sizeof(command), "cli -s .fpv.roiRect %s", roi_define);
 
     // Check if .fpv.enabled is set
     char enabled_status[16];
-    fp = popen("cli --get .fpv.enabled", "r");
+    fp = popen("cli -g .fpv.enabled", "r");
     if (fp == NULL) {
         printf("Failed to run command\n");
         return 1;
@@ -632,7 +883,7 @@ int setup_roi() {
 
     // Check if enabled_status is "true" or "false"
     if (strcmp(enabled_status, "true") != 0 && strcmp(enabled_status, "false") != 0) {
-		if (system("cli --set .fpv.enabled true") != 0) { printf("problem with reading fpv.enabled status\n"); }
+		if (system("cli -s .fpv.enabled true") != 0) { printf("problem with reading fpv.enabled status\n"); }
     }
 
     // Run the command to set ROI
@@ -640,7 +891,7 @@ int setup_roi() {
 
     // Check if .fpv.roiQp is set correctly
     char roi_qp_status[32];
-    fp = popen("cli --get .fpv.roiQp", "r");
+    fp = popen("cli -g .fpv.roiQp", "r");
     if (fp == NULL) {
         printf("Failed to run command\n");
         return 1;
@@ -661,7 +912,7 @@ int setup_roi() {
     }
 
     if (num_count != 4) {
-		if (system("cli --set .fpv.roiQp 0,0,0,0") != 0) { printf("Command failed\n"); }
+		if (system("cli -s .fpv.roiQp 0,0,0,0") != 0) { printf("Command failed\n"); }
     }
 
     return 0;
@@ -777,12 +1028,14 @@ void manage_fec_and_bitrate(int new_fec_k, int new_fec_n, int new_bitrate) {
 
     // Adjust fec and bitrate based on fec_change (if applicable)
     if (allow_dynamic_fec && fec_change > 0 && fec_change <= 5) {
-        float denominators[] = { 1, 1.11111, 1.25, 1.42, 1.66667, 2.0 };
-        float denominator = denominators[fec_change];
-        new_bitrate = (int)(new_bitrate / denominator);
-        // divide k or multiply n depending on fec_k_adjust option
-		(fec_k_adjust) ? (new_fec_k /= denominator) : (new_fec_n *= denominator);
-
+		
+		if ((spike_fix_dynamic_fec && new_bitrate >= 4000) || (!spike_fix_dynamic_fec)) {
+			float denominators[] = { 1, 1.11111, 1.25, 1.42, 1.66667, 2.0 };
+			float denominator = denominators[fec_change];
+			new_bitrate = (int)(new_bitrate / denominator);
+			// divide k or multiply n depending on fec_k_adjust option
+			(fec_k_adjust) ? (new_fec_k /= denominator) : (new_fec_n *= denominator);
+		}
     }
     
     // Update the global FEC OSD regardless of order.
@@ -862,6 +1115,8 @@ void apply_profile(Profile* profile) {
 	
     int currentDivideFpsBy = 1;
     int currentFPS = global_fps;
+    int finalPower;
+
 	
     // Determine FPS limit
     if (limitFPS && currentSetBitrate < 4000 && global_fps > 30 && total_pixels > 1300000) {
@@ -890,12 +1145,21 @@ void apply_profile(Profile* profile) {
     }
     // --- powerCommand ---
     {
-        const char *keys[] = { "power" };
-        char strPower[10];
-        snprintf(strPower, sizeof(strPower), "%d", currentWfbPower * tx_factor);
-        const char *values[] = { strPower };
-        format_command(powerCommand, sizeof(powerCommand), powerCommandTemplate, 1, keys, values);
+    const char *keys[] = { "power" };
+    char strPower[10];
+
+    if (use_0_to_10_txpower) {
+        // Look up the mapped driver power level using MCS and scaled 0–10 power index
+        finalPower = tx_power_table[currentSetMCS][power_level_0_to_10];
+    } else {
+        // Use raw multiplication for legacy behavior
+        finalPower = currentWfbPower * tx_factor;
     }
+
+    snprintf(strPower, sizeof(strPower), "%d", finalPower);
+    const char *values[] = { strPower };
+    format_command(powerCommand, sizeof(powerCommand), powerCommandTemplate, 1, keys, values);
+}
     // --- gopCommand ---
     {
         const char *keys[] = { "gop" };
@@ -924,6 +1188,8 @@ void apply_profile(Profile* profile) {
     }
     
     // --- Execution Logic ---
+	// If we're changing profile upwards, do this order
+	
     if (currentProfile > previousProfile) {
         if (currentQpDelta != prevQpDelta) {
             execute_command(qpDeltaCommand);
@@ -933,9 +1199,9 @@ void apply_profile(Profile* profile) {
             execute_command(fpsCommand);
             prevFPS = currentFPS;
         }
-        if (allow_set_power && currentWfbPower != prevWfbPower) {
+        if (allow_set_power && finalPower != prevWfbPower) {
             execute_command(powerCommand);
-            prevWfbPower = currentWfbPower;
+            prevWfbPower = finalPower;
         }
         if (currentSetGop != prevSetGop) {
             execute_command(gopCommand);
@@ -999,9 +1265,9 @@ void apply_profile(Profile* profile) {
             strcpy(prevSetGI, currentSetGI);
             prevSetMCS = currentSetMCS;
         }
-        if (allow_set_power && currentWfbPower != prevWfbPower) {
+        if (allow_set_power && finalPower != prevWfbPower) {
             execute_command(powerCommand);
-            prevWfbPower = currentWfbPower;
+            prevWfbPower = finalPower;
         }
         if (roi_focus_mode && strcmp(currentROIqp, prevROIqp) != 0) {
             execute_command(roiCommand);
@@ -1016,20 +1282,48 @@ void apply_profile(Profile* profile) {
     int k, n, stbc_val, ldpc_val, short_gi, actual_bandwidth, mcs_index, vht_mode, vht_nss;
     read_wfb_tx_cmd_output(&k, &n, &stbc_val, &ldpc_val, &short_gi, &actual_bandwidth, &mcs_index, &vht_mode, &vht_nss);
     const char *gi_string = short_gi ? "short" : "long";
-    int pwr = allow_set_power ? profile->wfbPower : 0;
-    sprintf(global_profile_osd, "%lds %d %d%s%d Pw%d g%.1f", 
+    int pwr = allow_set_power ? finalPower : 0;
+	
+	// Construct profile_OSD string 
+    sprintf(global_profile_osd, "%lds %d %d%s%d Pw(%d)%d g%.1f", 
             timeElapsed, 
             profile->setBitrate, 
             actual_bandwidth,
             gi_string,
             mcs_index,
+			power_level_0_to_10,
             pwr,
             profile->setGop);
 	
     snprintf(global_profile_fec_osd, sizeof(global_profile_fec_osd), "%d/%d", k, n);
 }
 
+int get_wlan0_channel(void) {
+    FILE *fp;
+    char line[256];
+    int channel = -1;
 
+    fp = popen("iw dev wlan0 info", "r");
+    if (!fp) {
+        perror("popen");
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        // Look for "channel " in the line
+        char *p = strstr(line, "channel ");
+        if (p) {
+            // Move past "channel "
+            p += strlen("channel ");
+            // atoi will stop at first non-digit, so it's fine if there's extra text
+            channel = atoi(p);
+            break;
+        }
+    }
+
+    pclose(fp);
+    return channel;
+}
 
 void *periodic_update_osd(void *arg) {
     osd_udp_config_t *osd_config = (osd_udp_config_t *)arg;
@@ -1048,14 +1342,20 @@ void *periodic_update_osd(void *arg) {
 
     while (true) {
         sleep(1);
-    
+		
+	//get wfb channel for OSD
+	int wfb_ch = get_wlan0_channel();
+     
     // Generate extra stats string
     snprintf(global_extra_stats_osd, sizeof(global_extra_stats_osd),
-             "pnlt%d xtx%ld(%d) gs_idr%d",
-             noise_pnlty,
-             global_total_tx_dropped,
-             total_keyframe_requests_xtx,
-             total_keyframe_requests);
+         "pnlt%d xtx%ld(%d)%s gs_idr%d [ch%d]",
+         noise_pnlty,
+         global_total_tx_dropped,
+         total_keyframe_requests_xtx,
+         bitrate_reduced ? "R" : "",
+         total_keyframe_requests,
+         wfb_ch);
+
     
     // Append the persistent VTX antenna warning if detected
     if (weak_antenna_detected) {
@@ -1076,11 +1376,15 @@ void *periodic_update_osd(void *arg) {
 		char full_osd_string[600];
 		
 		// Combine all osd strings, decide, based on osd_level what to display
-		if (osd_level >= 5) {		 // everything, over multiple lines
+		if (osd_level >= 6) {		 // everything, over multiple lines
+			snprintf(full_osd_string, sizeof(full_osd_string), "%s %s\n%s\n%s\n%s\n%s\n%s",
+					global_profile_osd, global_profile_fec_osd, local_regular_osd, global_score_related_osd, global_gs_stats_osd, global_extra_stats_osd, camera_bin);
+		
+		} else if (osd_level == 5) {		 // almost everything, over multiple lines
 			snprintf(full_osd_string, sizeof(full_osd_string), "%s %s\n%s\n%s\n%s\n%s",
 					global_profile_osd, global_profile_fec_osd, local_regular_osd, global_score_related_osd, global_gs_stats_osd, global_extra_stats_osd);
 					
-		} else if (osd_level == 4) { // everything on one line
+		} else if (osd_level == 4) { // almost everything on one line
 			snprintf(full_osd_string, sizeof(full_osd_string), "%s %s | %s | %s | %s | %s",
 					global_profile_osd, global_profile_fec_osd, local_regular_osd, global_score_related_osd, global_gs_stats_osd, global_extra_stats_osd);
 					
@@ -1133,7 +1437,7 @@ void *periodic_update_osd(void *arg) {
 
 bool value_chooses_profile(int input_value) {
     // Get the appropriate profile based on input
-    Profile* selectedProfile = get_profile(input_value);
+    selectedProfile = get_profile(input_value);
     if (selectedProfile == NULL) {
         printf("No matching profile found for input: %d\n", input_value);
 		return false;
@@ -1150,7 +1454,9 @@ bool value_chooses_profile(int input_value) {
 
     // If the previous profile is the same, do not apply changes
     if (previousProfile == currentProfile) {
-        printf("No change: Link value is within same profile.\n");
+        if (verbose_mode) {
+			printf("No change: Link value is within same profile.\n");
+		}
 		return false;
     }
 
@@ -1214,6 +1520,11 @@ void start_selection(int rssi_score, int snr_score, int recovered) {
 	float combined_value_float = rssi_score * rssi_weight + snr_score * snr_weight;
 	int osd_raw_score = (int)combined_value_float;
 
+	// Adjust score if limited
+	if (limit_max_score_to < 2000 && limit_max_score_to < combined_value_float) {
+		combined_value_float = (float)limit_max_score_to;
+	}
+
 	// Determine which exp_smoothing_factor to use (up or down)
     float chosen_smoothing_factor = (combined_value_float >= last_value_sent) ? smoothing_factor : smoothing_factor_down;
 
@@ -1243,8 +1554,9 @@ void start_selection(int rssi_score, int snr_score, int recovered) {
 
     // Check if the change exceeds the chosen hysteresis threshold
     if (percent_change >= hysteresis_threshold) {
-        printf("Qualified to request profile: %d is > %.2f%% different (%.2f%%)\n", combined_value, hysteresis_threshold, percent_change);
-
+        if (verbose_mode) {
+			printf("Qualified to request profile: %d is > %.2f%% different (%.2f%%)\n", combined_value, hysteresis_threshold, percent_change);
+		}
         // Request profile, check if applied
         if (value_chooses_profile(combined_value)) {
             printf("Profile %d applied.\n", combined_value);
@@ -1374,93 +1686,103 @@ void special_command_message(const char *msg) {
 
 
 //function to get latest tx dropped
-long get_wlan0_tx_dropped() {
-    FILE *fp;
-    char line[256];
-    long tx_dropped = 0;
-
-    // Open the /proc/net/dev file
-    fp = fopen("/proc/net/dev", "r");
-    if (fp == NULL) {
-        perror("Failed to open /proc/net/dev");
-        return -1;
+long get_wlan0_tx_dropped(void) {
+    const char *path = "/sys/class/net/wlan0/statistics/tx_dropped";
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        // silently return 0 on failure
+        return 0;
     }
 
-    // Skip the first two lines (headers)
-    if (fgets(line, sizeof(line), fp) == NULL || fgets(line, sizeof(line), fp) == NULL) { printf("fgets failed\n"); }
-
-    // Read each line to find the wlan0 interface
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        if (strstr(line, "wlan0:") != NULL) {
-            // Locate the stats after the "wlan0:" label
-            char *stats_str = strchr(line, ':');
-            if (stats_str) {
-                stats_str++;  // Move past the colon
-
-                // Tokenize to skip to the 12th field
-                char *token;
-                int field_count = 0;
-                token = strtok(stats_str, " ");
-
-                while (token != NULL) {
-                    field_count++;
-                    if (field_count == 12) {
-                        tx_dropped = strtol(token, NULL, 10);
-                        break;
-                    }
-                    token = strtok(NULL, " ");
-                }
-            }
-            break;
-        }
+    long tx_dropped;
+    if (fscanf(fp, "%ld", &tx_dropped) != 1) {
+        fclose(fp);
+        return 0;
     }
-
-    // Close the file
     fclose(fp);
-	
-    //calculate difference
-	long latest_tx_dropped = tx_dropped - global_total_tx_dropped;
-	//update global total
-	global_total_tx_dropped = tx_dropped;
-	return latest_tx_dropped;
 
+    long delta = tx_dropped - global_total_tx_dropped;
+    global_total_tx_dropped = tx_dropped;
+    return delta;
 }
 
 void *periodic_tx_dropped(void *arg) {
-    
     const char *idrCommand = idrCommandTemplate;
+	char roiCommand[MAX_COMMAND_SIZE];
+    const long restore_interval_ms = 1000;    // how long to wait before restoring full bit rate
 
-	// Wait until initialized_by_first_message
-	while (!initialized_by_first_message) {
-		sleep(1);
-	}
-	
+    struct timespec last_xtx_time = {0,0};
+
+    // Wait until initialized_by_first_message
+    while (!initialized_by_first_message) {
+        sleep(1);
+    }
+
     while (1) {
         long latest_tx_dropped = get_wlan0_tx_dropped();
 
-		struct timespec current_time;
-        clock_gettime(CLOCK_MONOTONIC, &current_time);
-        long elapsed_ms = (current_time.tv_sec - last_keyframe_request_time.tv_sec) * 1000 +
-                          (current_time.tv_nsec - last_keyframe_request_time.tv_nsec) / 1000000;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
 
-        if (latest_tx_dropped > 0 && elapsed_ms >= request_keyframe_interval_ms && allow_rq_kf_by_tx_d && prevSetGop > 0.5) {
-         
-			// Request new keyframe
-			char quotedCommand[BUFFER_SIZE];
-			snprintf(quotedCommand, sizeof(quotedCommand), "\"%s\"", idrCommand);
-					
-			if (system(quotedCommand) != 0) { printf("Command failed: %s\n", quotedCommand); }
-			last_keyframe_request_time = current_time;
-			total_keyframe_requests_xtx++;
-					
-			if (verbose_mode) {
-				printf("Requesting keyframe for locally dropped tx packet\n");
-			}
+        // compute ms since last_xtx_time
+        long since_xtx_ms = (now.tv_sec  - last_xtx_time.tv_sec)  * 1000 +
+                             (now.tv_nsec - last_xtx_time.tv_nsec) / 1000000;
+
+        // disable roi to help mitigate spikes (until next profile change)
+		if (roi_focus_mode && latest_tx_dropped > 0 && strcmp(prevROIqp, "0,0,0,0") != 0) {
+			
+			const char *keys[] = { "roiQp" };
+			const char *values[] = { "0,0,0,0" };
+			format_command(roiCommand, sizeof(roiCommand), roiCommandTemplate, 1, keys, values);
+    		execute_command(roiCommand);
+            strcpy(prevROIqp, "0,0,0,0");
+		}
+		
+		// 1) If we see dropped-tx, reduce bitrate (once) and reset timer.
+        if (allow_xtx_reduce_bitrate && latest_tx_dropped > 0) {
+            if (!bitrate_reduced) {
+                manage_fec_and_bitrate(prevSetFecK,
+                                       prevSetFecN,
+                                       (int)(prevSetBitrate * xtx_reduce_bitrate_factor));
+                bitrate_reduced = true;
+                if (verbose_mode)
+                    printf("Reduced bitrate due to tx-drops\n");
+            }
+            // bump the “last seen xtx”
+            last_xtx_time = now;
+        }
+
+        
+        // 2) If we've reduced, but no new tx-drops for >= restore_interval_ms, restore to the previous “normal” bitrate once.
+        
+        else if (bitrate_reduced && since_xtx_ms >= restore_interval_ms) {
+            manage_fec_and_bitrate(prevSetFecK,
+                                   prevSetFecN,
+                                   (int)prevSetBitrate);
+            bitrate_reduced = false;
+            if (verbose_mode)
+                printf("Restored normal bitrate after %ld ms without tx‑drops\n",
+                       since_xtx_ms);
+        }
+
+        long elapsed_kf_ms = (now.tv_sec  - last_keyframe_request_time.tv_sec)  * 1000 +
+                             (now.tv_nsec - last_keyframe_request_time.tv_nsec) / 1000000;
+
+        if (latest_tx_dropped > 0 && elapsed_kf_ms >= request_keyframe_interval_ms && allow_rq_kf_by_tx_d && prevSetGop > 0.5){
+            char quotedCommand[BUFFER_SIZE];
+            snprintf(quotedCommand, sizeof(quotedCommand), "\"%s\"", idrCommand);
+            if (system(quotedCommand) != 0)
+                printf("Command failed: %s\n", quotedCommand);
+            last_keyframe_request_time = now;
+            total_keyframe_requests_xtx++;
+            if (verbose_mode)
+                printf("Requesting keyframe for locally dropped tx packet\n");
         }
 
         usleep(check_xtx_period_ms * 1000);
     }
 }
+
 
 void *count_messages(void *arg) {
     int local_count;
@@ -1623,7 +1945,323 @@ void process_message(const char *msg) {
     pthread_mutex_unlock(&pause_mutex);
 }
 
+static int update_alink_config_param(const char *key, const char *value) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "sed -i 's/^%s=.*/%s=%s/' %s",
+             key, key, value, CONFIG_FILE);
+    return system(cmd);
+}
 
+// alink GET commands
+char* alink_GET_commands(const char* command) {
+    static char trimmed[128];
+    strncpy(trimmed, command, sizeof(trimmed)-1);
+    trimmed[sizeof(trimmed)-1] = '\0';
+    trim_whitespace(trimmed);
+
+    if (verbose_mode) printf("[DEBUG] GET command received: '%s'\n", trimmed);
+
+    if (strcmp(trimmed, "osd_level") == 0) {
+        static char result[16];
+        snprintf(result, sizeof(result), "%d", osd_level);
+        return result;
+			
+    } else if (strcmp(trimmed, "multiply_font_size_by") == 0) {
+        static char result[16];
+        snprintf(result, sizeof(result), "%.3f", multiply_font_size_by);
+        return result;
+		
+	} else if (strcmp(trimmed, "roi_focus_mode") == 0) {
+		static char result[6];
+		snprintf(result, sizeof(result), "%d", roi_focus_mode);
+		return result;
+	
+	} else if (strcmp(trimmed, "limit_max_score_to") == 0) {
+		static char result[6];
+		snprintf(result, sizeof(result), "%d", limit_max_score_to);
+		return result;
+		
+    } else {
+        if (verbose_mode) {
+            return "Unknown GET command";
+        }
+        return "";
+    }
+}
+
+// alink SET commands
+char* alink_SET_commands(const char* command, const char* arg) {
+    static char result[16];
+
+    if (strcmp(command, "osd_level") == 0) {
+        int val = atoi(arg);
+        if (val < 0) val = 0;
+        if (val > 6) val = 6;
+        osd_level = val;
+
+        if (val == 0) {
+            // Clear MSPOSD.msg to remove OSD
+            fclose(fopen("/tmp/MSPOSD.msg", "w"));
+        }
+
+        snprintf(result, sizeof(result), "%d", osd_level);
+
+        // Save to alink.conf
+        char val_str[16];
+        snprintf(val_str, sizeof(val_str), "%d", val);
+        update_alink_config_param("osd_level", val_str);
+
+        return result;
+
+    } else if (strcmp(command, "multiply_font_size_by") == 0) {
+        float val = atof(arg);
+        if (val < 0.3f) val = 0.3f;
+        if (val > 2.5f) val = 2.5f;
+        multiply_font_size_by = val;
+
+        get_resolution_with_default();
+        adjust_font_size();
+
+        snprintf(result, sizeof(result), "%.3f", multiply_font_size_by);
+
+        // Save to alink.conf
+        char val_str[16];
+        snprintf(val_str, sizeof(val_str), "%.3f", val);
+        update_alink_config_param("multiply_font_size_by", val_str);
+
+        return result;
+	
+	} else if (strcmp(command, "roi_focus_mode") == 0) {
+		bool val = (atoi(arg) != 0);  // treat any nonzero as true
+		roi_focus_mode = val;
+
+		static char result[6];
+		snprintf(result, sizeof(result), "%d", roi_focus_mode);
+		
+		if (roi_focus_mode) {
+			if (setup_roi() != 0) {
+				printf("Failed to re-set focus mode regions\n");
+			} else {
+				printf("Focus mode regions re-set in majestic.yaml\n");
+				printf("%s\n", system("killall -HUP majestic") == 0 ? "killMajSuccess" : "killMajFailure");
+			}
+		}
+		
+		if (selectedProfile != NULL) {
+            apply_profile(selectedProfile);
+            printf("Profile re-applied to update roi\n");
+        }
+		
+		// Persist to alink.conf
+		update_alink_config_param("roi_focus_mode", result);
+
+		return result;
+
+	} else if (strcmp(command, "limit_max_score_to") == 0) {
+        int val = atoi(arg);
+        if (val < 1000) val = 1000;
+        if (val > 2000) val = 2000;
+        limit_max_score_to = val;
+
+        snprintf(result, sizeof(result), "%d", limit_max_score_to);
+
+        // Save to alink.conf
+        //char val_str[16];
+        //snprintf(val_str, sizeof(val_str), "%d", val);
+        //update_alink_config_param("limit_max_score_to", val_str);
+
+        return result;
+	
+    } else {
+        if (verbose_mode) {
+            return "Unknown SET command";
+        }
+        return "";
+    }
+}
+
+
+
+
+void *alink_command_listener_thread(void *arg) {
+    int srv_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv_fd < 0) {
+        perror("alink_cmd socket");
+        return NULL;
+    }
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, ALINK_CMD_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    unlink(ALINK_CMD_SOCKET_PATH);
+
+    if (bind(srv_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("alink_cmd bind");
+        close(srv_fd);
+        return NULL;
+    }
+
+    if (listen(srv_fd, 1) < 0) {
+        perror("alink_cmd listen");
+        close(srv_fd);
+        return NULL;
+    }
+
+    printf("alink: command socket listening on %s\n", ALINK_CMD_SOCKET_PATH);
+
+    for (;;) {
+        int cl_fd = accept(srv_fd, NULL, NULL);
+        if (cl_fd < 0) {
+            perror("alink_cmd accept");
+            continue;
+        }
+
+        struct alink_msg_hdr hdr;
+        ssize_t n = read(cl_fd, &hdr, sizeof(hdr));
+        if (n != sizeof(hdr)) {
+            fprintf(stderr, "alink_cmd: invalid header read (%zd bytes)\n", n);
+            close(cl_fd);
+            continue;
+        }
+
+        hdr.cmd = ntohs(hdr.cmd);
+        hdr.len = ntohs(hdr.len);
+
+        // Receive set_alink_power command
+		if (hdr.cmd == CMD_SET_POWER && hdr.len == sizeof(uint32_t)) {
+            uint32_t net_v;
+            if (read(cl_fd, &net_v, sizeof(net_v)) != sizeof(net_v)) {
+                fprintf(stderr, "alink_cmd: failed to read power value\n");
+                close(cl_fd);
+                continue;
+            }
+
+            int v = ntohl(net_v);
+            int32_t status;
+
+            if (v >= 0 && v <= 10) {
+                pthread_mutex_lock(&alink_tx_power_mutex);
+                power_level_0_to_10 = v;
+                pthread_mutex_unlock(&alink_tx_power_mutex);
+                printf("alink: TX power updated to %d via command socket\n", v);
+
+                if (use_0_to_10_txpower && selectedProfile != NULL) {
+                    apply_profile(selectedProfile);
+                    printf("Profile re-applied to SET power to %d\n", v);
+                }
+                status = 0;
+            } else {
+                status = 1;
+            }
+
+            struct alink_msg_hdr resp_hdr = {
+                .cmd = htons(CMD_SET_POWER | CMD_STATUS_REPLY),
+                .len = htons(sizeof(status))
+            };
+            int32_t net_status = htonl(status);
+
+            if (write(cl_fd, &resp_hdr, sizeof(resp_hdr)) < 0)
+                perror("write resp_hdr (CMD_SET_POWER)");
+
+            if (write(cl_fd, &net_status, sizeof(net_status)) < 0)
+                perror("write net_status (CMD_SET_POWER)");
+        }
+		
+		// Receive all tunnel stats (stdout piped from tunnel wfb_rx to forwarder)
+        else if (hdr.cmd == CMD_ANTENNA_STATS) {
+            if (hdr.len > 0 && hdr.len < MAX_RSSI_LINE) {
+                char buf[MAX_RSSI_LINE] = {0};
+                ssize_t m = read(cl_fd, buf, hdr.len);
+                if (m != hdr.len) {
+                    fprintf(stderr, "alink_cmd: malformed RX_ANT payload (read %zd bytes, expected %u)\n", m, hdr.len);
+                    close(cl_fd);
+                    continue;
+                }
+                buf[hdr.len] = '\0';
+
+                if (enqueue_rssi_line(buf) < 0) {
+					fprintf(stderr, "RSSI queue full, dropping line\n");
+				}
+
+            } else {
+                fprintf(stderr, "alink_cmd: invalid RX_ANT length: %u\n", hdr.len);
+            }
+
+            struct alink_msg_hdr resp_hdr = {
+                .cmd = htons(CMD_ANTENNA_STATS | CMD_STATUS_REPLY),
+                .len = htons(sizeof(uint32_t))
+            };
+            uint32_t ok = htonl(0);
+
+            if (write(cl_fd, &resp_hdr, sizeof(resp_hdr)) < 0)
+                perror("write resp_hdr (CMD_ANTENNA_STATS)");
+
+            if (write(cl_fd, &ok, sizeof(ok)) < 0)
+                perror("write ok (CMD_ANTENNA_STATS)");
+        }
+
+		// Received GET or SET command
+		else if (hdr.cmd == CMD_GET || hdr.cmd == CMD_SET) {
+			if (hdr.len > 0 && hdr.len < 256) {
+				char buf[256] = {0};
+				ssize_t m = read(cl_fd, buf, hdr.len);
+				if (m != hdr.len) {
+					fprintf(stderr, "alink_cmd: malformed command payload (read %zd bytes, expected %u)\n", m, hdr.len);
+					close(cl_fd);
+					continue;
+				}
+				buf[hdr.len] = '\0';
+
+				char* response;
+				if (hdr.cmd == CMD_GET) {
+					response = alink_GET_commands(buf);
+				} else {
+					// Split command and argument
+					char* space = strchr(buf, ' ');
+					if (space) {
+						*space = '\0';
+						response = alink_SET_commands(buf, space + 1);
+					} else {
+						response = "Missing argument for SET command";
+					}
+				}
+
+				struct alink_msg_hdr resp_hdr = {
+					.cmd = htons(hdr.cmd | CMD_STATUS_REPLY),
+					.len = htons(strlen(response))
+				};
+				if (write(cl_fd, &resp_hdr, sizeof(resp_hdr)) < 0)
+					perror("write resp_hdr (GET/SET)");
+
+				if (write(cl_fd, response, strlen(response)) < 0)
+					perror("write response (GET/SET)");
+			} else {
+				fprintf(stderr, "alink_cmd: invalid GET/SET length: %u\n", hdr.len);
+			}
+		}
+        else {
+            fprintf(stderr, "alink_cmd: unknown command: 0x%04x\n", hdr.cmd);
+
+            struct alink_msg_hdr resp_hdr = {
+                .cmd = htons(hdr.cmd | CMD_STATUS_REPLY),
+                .len = htons(sizeof(uint32_t))
+            };
+            uint32_t err = htonl(1);
+
+            if (write(cl_fd, &resp_hdr, sizeof(resp_hdr)) < 0)
+                perror("write resp_hdr (unknown cmd)");
+
+            if (write(cl_fd, &err, sizeof(err)) < 0)
+                perror("write err (unknown cmd)");
+        }
+
+        close(cl_fd);
+    }
+
+    close(srv_fd);
+    unlink(ALINK_CMD_SOCKET_PATH);
+    return NULL;
+}
 
 
 void print_usage() {
@@ -1634,9 +2272,6 @@ void print_usage() {
     printf("  --verbose    Enable verbose output\n");
     printf("  --pace-exec  Maj/wfb control execution pacing interval in milliseconds (default: %d ms)\n", DEFAULT_PACE_EXEC_MS);
 }
-
-
-
 
 int main(int argc, char *argv[]) {
     load_config(CONFIG_FILE);
@@ -1683,7 +2318,8 @@ int main(int argc, char *argv[]) {
             }
 
             printf("OSD UDP output enabled to %s:%d\n", osd_config.udp_out_ip, osd_config.udp_out_port);
-        } else {
+        						
+		} else {
             print_usage();
             return 1;
         }
@@ -1712,9 +2348,27 @@ int main(int argc, char *argv[]) {
 
     printf("Listening on UDP port %d, IP: %s...\n", port, ip);
 	
-	// Find out wifi card
-	determine_tx_power_equation();
-    printf("TX Power Factor: %d\n", tx_factor);
+	
+	pthread_t alink_cmd_thread;
+	if (pthread_create(&alink_cmd_thread, NULL,
+                   alink_command_listener_thread, NULL) != 0) {
+		fprintf(stderr, "failed to start air_man command listener thread\n");
+	}
+	
+	
+	// determine power factor and load tables if required
+	if (!use_0_to_10_txpower) {
+		determine_tx_power_equation();
+	} else {
+		tx_factor = 1;
+		load_tx_power_table();
+		print_tx_power_table();
+		
+		// Example usage: get the power value for MCS3, power level 5
+		//printf("MCS3, Power Index 5: %d\n", tx_power_table[3][5]);
+		
+	}
+	printf("TX Power Factor: %d\n", tx_factor);
 
 	// Get any required values from wfb.yaml (eg ldpc_tx and stbc)
 	if (get_card_info_from_yaml) {
@@ -1723,21 +2377,16 @@ int main(int argc, char *argv[]) {
 	// Print S and L
 	printf("ldpc_tx: %d\nstbc: %d\n", ldpc_tx, stbc);
 	
-	// Get resolution
-	if (get_resolution() != 0) {
-					printf("Failed to get resolution. Assuming 1920x1080\n");
-					x_res = 1920;
-					y_res = 1080;
-	}
+	// Get camera bin
 	
-	total_pixels = x_res * y_res;
+	if (get_camera_bin() != 0) {
+        // Log the failure and continue
+        printf("Didn't retrieve camera bin filename. Continuing...\n");
+    }
 
-	set_osd_font_size = (x_res < 1280) ? ((int)(20 * multiply_font_size_by)) :
-                    (x_res < 1700) ? ((int)(25 * multiply_font_size_by)) :
-                    (x_res < 2000) ? ((int)(35 * multiply_font_size_by)) :
-                    (x_res < 2560) ? ((int)(45 * multiply_font_size_by)) :
-                                    ((int)(50 * multiply_font_size_by));
-
+	get_resolution_with_default();
+	
+	adjust_font_size();
 	
 	//Get fps value from majestic
 	int fps = get_video_fps();
@@ -1829,5 +2478,4 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
-
 
