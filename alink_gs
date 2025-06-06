@@ -26,10 +26,10 @@ snr_weight = 0.5
 rssi_weight = 0.5
 
 [ranges]
-SNR_MIN = 12
-SNR_MAX = 38
-RSSI_MIN = -80
-RSSI_MAX = -30
+SNR_MIN = 8
+SNR_MAX = 36
+RSSI_MIN = -85
+RSSI_MAX = -40
 
 [keyframe]
 allow_idr = True
