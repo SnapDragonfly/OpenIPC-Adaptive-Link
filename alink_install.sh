@@ -146,6 +146,7 @@ if [ -f "$PATH_SERVICE" ]; then
     sudo systemctl stop $FILE_NAME.service
     sudo systemctl disable $FILE_NAME.service
     sudo rm -f $FILE $FILE_CONF $PATH_SERVICE
+    sudo rm -f /config/alink_gs.conf
     echo_green "Adaptive Link ($FILE_NAME) removed."
 else
     echo_blue "Service file $PATH_SERVICE not found, skipping..."
