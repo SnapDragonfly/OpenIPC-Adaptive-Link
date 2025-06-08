@@ -146,7 +146,6 @@ if [ -f "$PATH_SERVICE" ]; then
     sudo systemctl stop $FILE_NAME.service
     sudo systemctl disable $FILE_NAME.service
     sudo rm -f $FILE $FILE_CONF $PATH_SERVICE
-    sudo rm -f /config/alink_gs.conf
     echo_green "Adaptive Link ($FILE_NAME) removed."
 else
     echo_blue "Service file $PATH_SERVICE not found, skipping..."
@@ -159,6 +158,11 @@ if [ -f "/etc/systemd/system/adaptive_link.service" ]; then
     sudo rm -f /usr/bin/adaptive_link /etc/adaptive_link.conf /etc/systemd/system/adaptive_link.service
     echo_green "Old Adaptive Link (adaptive_link) removed."
 fi
+
+# Delete config regardless
+sudo rm -f /config/alink_gs.conf
+
+
 ;;
 		update)
 			echo_blue "Updating Adaptive Link for Ground Station..."
