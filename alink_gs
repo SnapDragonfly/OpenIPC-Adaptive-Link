@@ -26,18 +26,18 @@ snr_weight = 0.5
 rssi_weight = 0.5
 
 [ranges]
-SNR_MIN = 8
+SNR_MIN = 10
 SNR_MAX = 36
 RSSI_MIN = -85
 RSSI_MAX = -40
 
 [keyframe]
-allow_idr = True
+allow_idr = TRue
 idr_max_messages = 20
 
 [dynamic refinement]
-allow_penalty = True
-allow_fec_increase = True
+allow_penalty = False
+allow_fec_increase = False
 
 [noise]
 min_noise = 0.01
