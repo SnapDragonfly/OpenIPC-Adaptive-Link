@@ -101,6 +101,7 @@ Most recent radxa image from Johhn or CC should include alink, though it may not
 ```
 sudo curl -L -o alink_install.sh https://raw.githubusercontent.com/OpenIPC/adaptive-link/refs/heads/main/alink_install.sh
 sudo chmod +x alink_install.sh
+sudo ./alink_install.sh gs remove
 sudo ./alink_install.sh gs install
 ```
 
