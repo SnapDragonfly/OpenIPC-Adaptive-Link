@@ -157,8 +157,6 @@ if [ -f "/etc/systemd/system/adaptive_link.service" ]; then
     sudo systemctl disable adaptive_link.service
     sudo rm -f /usr/bin/adaptive_link /etc/adaptive_link.conf /etc/systemd/system/adaptive_link.service
     echo_green "Old Adaptive Link (adaptive_link) removed."
-else
-    echo_blue "Service file /etc/systemd/system/adaptive_link.service not found, skipping..."
 fi
 ;;
 		update)
