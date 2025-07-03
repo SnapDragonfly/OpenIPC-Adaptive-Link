@@ -209,7 +209,7 @@ void load_tx_power_table(void) {
 
     // 1) get adapter name
     snprintf(cmd, sizeof(cmd),
-             "yaml-cli -i %s -g .wireless.wlan_adapter",
+             "yaml-cli-multi -i %s -g .wireless.wlan_adapter",
              WFB_YAML);
     fp = popen(cmd, "r");
     if (!fp || !fgets(adapter, sizeof(adapter), fp)) {
@@ -229,12 +229,12 @@ void load_tx_power_table(void) {
 
         // build command (remove brackets only)
         snprintf(cmd, sizeof(cmd),
-                 "yaml-cli -i %s -g \".profiles.%s.tx_power.mcs%d\" | sed 's/[][]//g'",
+                 "yaml-cli-multi -i %s -g \".profiles.%s.tx_power.mcs%d\" | sed 's/[][]//g'",
                  WIFI_ADAPTERS_YAML, adapter, mcs);
 
         fp = popen(cmd, "r");
         if (!fp) {
-            fprintf(stderr, "Failed to run yaml-cli for MCS%d\n", mcs);
+            fprintf(stderr, "Failed to run yaml-cli-multi for MCS%d\n", mcs);
             continue;
         }
 
@@ -756,8 +756,8 @@ int check_module_loaded(const char *module_name) {
 }
 
 void load_from_vtx_info_yaml() {
-    char command1[] = "yaml-cli -i /etc/wfb.yaml -g .broadcast.ldpc";
-    char command2[] = "yaml-cli -i /etc/wfb.yaml -g .broadcast.stbc";
+    char command1[] = "yaml-cli-multi -i /etc/wfb.yaml -g .broadcast.ldpc";
+    char command2[] = "yaml-cli-multi -i /etc/wfb.yaml -g .broadcast.stbc";
     
     char buffer[128]; // Buffer to store command output
     FILE *pipe;
