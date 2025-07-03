@@ -103,8 +103,8 @@ int previousProfile = -2;
 long prevTimeStamp = 0;
 
 bool allow_set_power = 1;
-bool use_0_to_10_txpower = 0;
-int power_level_0_to_10 = 0;
+bool use_0_to_4_txpower = 0;
+int power_level_0_to_4 = 0;
 float rssi_weight = 0.5;
 float snr_weight = 0.5;
 int hold_fallback_mode_s = 2;
@@ -557,11 +557,11 @@ void load_config(const char* filename) {
         if (key && value) {
             if (strcmp(key, "allow_set_power") == 0) {
                 allow_set_power = atoi(value);
-			} else if (strcmp(key, "use_0_to_10_txpower") == 0) {
-                use_0_to_10_txpower = atoi(value);
+			} else if (strcmp(key, "use_0_to_4_txpower") == 0) {
+                use_0_to_4_txpower = atoi(value);
 
-			} else if (strcmp(key, "power_level_0_to_10") == 0) {
-                power_level_0_to_10 = atoi(value);
+			} else if (strcmp(key, "power_level_0_to_4") == 0) {
+                power_level_0_to_4 = atoi(value);
 
 				
 			} else if (strcmp(key, "rssi_weight") == 0) {
@@ -1148,9 +1148,9 @@ void apply_profile(Profile* profile) {
     const char *keys[] = { "power" };
     char strPower[10];
 
-    if (use_0_to_10_txpower) {
-        // Look up the mapped driver power level using MCS and scaled 0–10 power index
-        finalPower = tx_power_table[currentSetMCS][power_level_0_to_10];
+    if (use_0_to_4_txpower) {
+        // Look up the mapped driver power level using MCS and scaled 0–4 power index
+        finalPower = tx_power_table[currentSetMCS][power_level_0_to_4];
     } else {
         // Use raw multiplication for legacy behavior
         finalPower = currentWfbPower * tx_factor;
@@ -1291,7 +1291,7 @@ void apply_profile(Profile* profile) {
             actual_bandwidth,
             gi_string,
             mcs_index,
-			power_level_0_to_10,
+			power_level_0_to_4,
             pwr,
             profile->setGop);
 	
@@ -2139,13 +2139,13 @@ void *alink_command_listener_thread(void *arg) {
             int v = ntohl(net_v);
             int32_t status;
 
-            if (v >= 0 && v <= 10) {
+            if (v >= 0 && v <= 4) {
                 pthread_mutex_lock(&alink_tx_power_mutex);
-                power_level_0_to_10 = v;
+                power_level_0_to_4 = v;
                 pthread_mutex_unlock(&alink_tx_power_mutex);
                 printf("alink: TX power updated to %d via command socket\n", v);
 
-                if (use_0_to_10_txpower && selectedProfile != NULL) {
+                if (use_0_to_4_txpower && selectedProfile != NULL) {
                     apply_profile(selectedProfile);
                     printf("Profile re-applied to SET power to %d\n", v);
                 }
@@ -2357,7 +2357,7 @@ int main(int argc, char *argv[]) {
 	
 	
 	// determine power factor and load tables if required
-	if (!use_0_to_10_txpower) {
+	if (!use_0_to_4_txpower) {
 		determine_tx_power_equation();
 	} else {
 		tx_factor = 1;
