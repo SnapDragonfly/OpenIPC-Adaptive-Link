@@ -144,13 +144,14 @@ bool paused = false;
 bool time_synced = false;
 int last_value_sent = 100;
 struct timespec last_exec_time;
-struct timespec last_keyframe_request_time;
-pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t pause_mutex = PTHREAD_MUTEX_INITIALIZER;
+struct timespec last_keyframe_request_time;	// Last keyframe request command
+pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;  // Mutex for message count
+pthread_mutex_t pause_mutex = PTHREAD_MUTEX_INITIALIZER;  // Mutex for pause state
+pthread_mutex_t keyframe_mutex = PTHREAD_MUTEX_INITIALIZER;  // Mutex for keyframe request array
 
-#define MAX_CODES 5       // Maximum unique idr rq to track
-#define CODE_LENGTH 8
-#define EXPIRY_TIME_MS 1000
+#define MAX_CODES 5       // Maximum number of unique keyframe requests to track
+#define CODE_LENGTH 8     // Max length of each unique code
+#define EXPIRY_TIME_MS 1000 // Code expiry time in milliseconds
 
 int total_keyframe_requests = 0;
 int total_keyframe_requests_xtx = 0;
@@ -460,6 +461,45 @@ long get_monotonic_time() {
     return ts.tv_sec;
 }
 
+// Safer time calculation to avoid overflow and handle negative time
+static long calculate_elapsed_time_ms(const struct timespec *current, const struct timespec *past) {
+    long long sec_diff = (long long)current->tv_sec - past->tv_sec;
+    long long nsec_diff = (long long)current->tv_nsec - past->tv_nsec;
+
+    // Check for overflow in seconds conversion
+    if (sec_diff > LONG_MAX / 1000) {
+        return LONG_MAX; // Return max value if overflow would occur
+    }
+
+    long long elapsed_ms = sec_diff * 1000 + nsec_diff / 1000000;
+
+    // Handle negative time (clock went backwards)
+    if (elapsed_ms < 0) {
+        return 0;
+    }
+
+    return (elapsed_ms > LONG_MAX) ? LONG_MAX : (long)elapsed_ms;
+}
+
+// Safer time calculation for timeval structures to avoid overflow and handle negative time
+static long calculate_elapsed_time_ms_timeval(const struct timeval *current, const struct timeval *past) {
+    long long sec_diff = (long long)current->tv_sec - past->tv_sec;
+    long long usec_diff = (long long)current->tv_usec - past->tv_usec;
+
+    // Check for overflow in seconds conversion
+    if (sec_diff > LONG_MAX / 1000) {
+        return LONG_MAX; // Return max value if overflow would occur
+    }
+
+    long long elapsed_ms = sec_diff * 1000 + usec_diff / 1000;
+
+    // Handle negative time (clock went backwards)
+    if (elapsed_ms < 0) {
+        return 0;
+    }
+
+    return (elapsed_ms > LONG_MAX) ? LONG_MAX : (long)elapsed_ms;
+}
 int get_camera_bin() {
     char sensor_config[256];
 
@@ -1536,7 +1576,7 @@ void start_selection(int rssi_score, int snr_score, int recovered) {
 	sprintf(global_score_related_osd, "linkQ %d, smthdQ %d", osd_raw_score, osd_smoothed_score);
 
 	// Check if enough time has passed
-    long time_diff_ms = (current_time.tv_sec - last_exec_time.tv_sec) * 1000 + (current_time.tv_nsec - last_exec_time.tv_nsec) / 1000000;
+    long time_diff_ms = calculate_elapsed_time_ms(&current_time, &last_exec_time);
     if (time_diff_ms < min_between_changes_ms) {
         printf("Skipping profile load: time_diff_ms=%ldms - too soon (min %dms required)\n", time_diff_ms, min_between_changes_ms);
         selection_busy = false;
@@ -1570,12 +1610,13 @@ void start_selection(int rssi_score, int snr_score, int recovered) {
 
 // request_keyframe function to check if a code exists in the array and has not expired
 bool code_exists(const char *code, struct timespec *current_time) {
+    pthread_mutex_lock(&keyframe_mutex);
     for (int i = 0; i < num_keyframe_requests; i++) {
         if (strcmp(keyframe_request_codes[i].code, code) == 0) {
-            // Check if the request is still valid
-            long elapsed_time_ms = (current_time->tv_sec - keyframe_request_codes[i].timestamp.tv_sec) * 1000 +
-                                   (current_time->tv_nsec - keyframe_request_codes[i].timestamp.tv_nsec) / 1000000;
+            // Check if the request is still valid using safer time calculation
+            long elapsed_time_ms = calculate_elapsed_time_ms(current_time, &keyframe_request_codes[i].timestamp);
             if (elapsed_time_ms < EXPIRY_TIME_MS) {
+                pthread_mutex_unlock(&keyframe_mutex);
                 return true;  // Code exists and has not expired
             } else {
                 // Expired: Remove it by shifting the rest down
@@ -1583,15 +1624,18 @@ bool code_exists(const char *code, struct timespec *current_time) {
                         (num_keyframe_requests - i - 1) * sizeof(KeyframeRequest));
                 num_keyframe_requests--;
 				i--;  // Adjust index to re-check at this position after shift
+                pthread_mutex_unlock(&keyframe_mutex);
                 return false;  // Code expired
             }
         }
     }
+    pthread_mutex_unlock(&keyframe_mutex);
     return false;  // Code not found
 }
 
 // Function to add a code to the array
 void add_code(const char *code, struct timespec *current_time) {
+    pthread_mutex_lock(&keyframe_mutex);
     if (num_keyframe_requests < MAX_CODES) {
         strncpy(keyframe_request_codes[num_keyframe_requests].code, code, CODE_LENGTH);
         keyframe_request_codes[num_keyframe_requests].timestamp = *current_time;
@@ -1599,23 +1643,49 @@ void add_code(const char *code, struct timespec *current_time) {
     } else {
         printf("Max keyframe request codes reached. Consider increasing MAX_CODES.\n");
     }
+    pthread_mutex_unlock(&keyframe_mutex);
 }
 
 void cleanup_expired_codes(struct timespec *current_time) {
-    for (int i = 0; i < num_keyframe_requests; ) {
-        // Calculate elapsed time in milliseconds
-        long elapsed_time_ms = (current_time->tv_sec - keyframe_request_codes[i].timestamp.tv_sec) * 1000 +
-                               (current_time->tv_nsec - keyframe_request_codes[i].timestamp.tv_nsec) / 1000000;
+    pthread_mutex_lock(&keyframe_mutex);
 
-        // Remove the expired entry if elapsed time exceeds expiry threshold
+    if (num_keyframe_requests <= 0) {
+        pthread_mutex_unlock(&keyframe_mutex);
+        return;
+    }
+
+    // Find the most recent entry using calculate_elapsed_time_ms (smallest elapsed time)
+    int most_recent_idx = 0;
+    long min_elapsed = calculate_elapsed_time_ms(current_time, &keyframe_request_codes[0].timestamp);
+    for (int i = 1; i < num_keyframe_requests; i++) {
+        long elapsed = calculate_elapsed_time_ms(current_time, &keyframe_request_codes[i].timestamp);
+        if (elapsed < min_elapsed) {
+            min_elapsed = elapsed;
+            most_recent_idx = i;
+        }
+    }
+
+    // Remove expired codes except the most recent
+    for (int i = 0; i < num_keyframe_requests; ) {
+        if (i == most_recent_idx) {
+            i++;
+            continue;
+        }
+        long elapsed_time_ms = calculate_elapsed_time_ms(current_time, &keyframe_request_codes[i].timestamp);
+        printf("Keyframe request code: %s, Elapsed time: %ld ms\n", keyframe_request_codes[i].code, elapsed_time_ms);
         if (elapsed_time_ms >= EXPIRY_TIME_MS) {
             memmove(&keyframe_request_codes[i], &keyframe_request_codes[i + 1],
                     (num_keyframe_requests - i - 1) * sizeof(KeyframeRequest));
-            num_keyframe_requests--;  // Decrease the count of requests
+            num_keyframe_requests--;
+            // If we removed an entry before the most recent one, adjust its index
+            if (i < most_recent_idx) {
+                most_recent_idx--;
+            }
         } else {
-            i++;  // Only move to the next entry if no removal
+            i++;
         }
     }
+    pthread_mutex_unlock(&keyframe_mutex);
 }
 
 // Main function to handle special commands
@@ -1639,9 +1709,8 @@ void special_command_message(const char *msg) {
         // Clean up expired codes before proceeding
         cleanup_expired_codes(&current_time);
 
-        // Check if the keyframe request interval has elapsed
-        long elapsed_ms = (current_time.tv_sec - last_keyframe_request_time.tv_sec) * 1000 +
-                          (current_time.tv_nsec - last_keyframe_request_time.tv_nsec) / 1000000;
+        // Check if the keyframe request interval has elapsed using safer time calculation
+        long elapsed_ms = calculate_elapsed_time_ms(&current_time, &last_keyframe_request_time);
 
         if (elapsed_ms >= request_keyframe_interval_ms) {
             if (!code_exists(code, &current_time)) {
@@ -1726,8 +1795,7 @@ void *periodic_tx_dropped(void *arg) {
         clock_gettime(CLOCK_MONOTONIC, &now);
 
         // compute ms since last_xtx_time
-        long since_xtx_ms = (now.tv_sec  - last_xtx_time.tv_sec)  * 1000 +
-                             (now.tv_nsec - last_xtx_time.tv_nsec) / 1000000;
+        long since_xtx_ms = calculate_elapsed_time_ms(&now, &last_xtx_time);
 
         // disable roi to help mitigate spikes (until next profile change)
 		if (roi_focus_mode && latest_tx_dropped > 0 && strcmp(prevROIqp, "0,0,0,0") != 0) {
@@ -1766,8 +1834,7 @@ void *periodic_tx_dropped(void *arg) {
                        since_xtx_ms);
         }
 
-        long elapsed_kf_ms = (now.tv_sec  - last_keyframe_request_time.tv_sec)  * 1000 +
-                             (now.tv_nsec - last_keyframe_request_time.tv_nsec) / 1000000;
+        long elapsed_kf_ms = calculate_elapsed_time_ms(&now, &last_keyframe_request_time);
 
         if (latest_tx_dropped > 0 && elapsed_kf_ms >= request_keyframe_interval_ms && allow_rq_kf_by_tx_d && prevSetGop > 0.5){
             char quotedCommand[BUFFER_SIZE];
@@ -1901,9 +1968,8 @@ void process_message(const char *msg) {
         first_time = 0;
     }
 
-    // Calculate the time difference in milliseconds
-    long elapsed_ms = (current_time.tv_sec - last_fec_call_time.tv_sec) * 1000 +
-                      (current_time.tv_usec - last_fec_call_time.tv_usec) / 1000;
+    // Calculate the time difference in milliseconds using safer method
+    long elapsed_ms = calculate_elapsed_time_ms_timeval(&current_time, &last_fec_call_time);
 
     // Only call manage_fec_and_bitrate if a fec_change has occurred and
     // at least 1 second has elapsed since the last call
