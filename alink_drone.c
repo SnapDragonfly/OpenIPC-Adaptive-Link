@@ -1658,13 +1658,14 @@ void special_command_message(const char *msg) {
 				total_keyframe_requests++;
             } else {
                 if (verbose_mode) {
-					printf("Already requested keyframe for code: %s\n", code);
-				}
-			}
+                    printf("Already requested keyframe for code: %s\n", code);
+                }
+            }
         } else {
                 if (verbose_mode) {
-					printf("Keyframe request ignored. Interval not met for code: %s\n", code);
-				}
+
+                    printf("Keyframe request ignored. Interval  %ld not met for code: %s\n", elapsed_ms, code);
+                }
         }
 
     } else if (strcmp(cleaned_msg, "pause_adaptive") == 0) {
