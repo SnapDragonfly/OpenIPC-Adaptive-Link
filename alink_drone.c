@@ -1,19 +1,19 @@
-#include <stdio.h>  
-#include <stdlib.h>  
-#include <string.h>  
-#include <unistd.h>   
-#include <pthread.h>   
-#include <sys/socket.h>  
-#include <netinet/in.h>  
-#include <arpa/inet.h>  
-#include <stdbool.h>    
-#include <sys/time.h>  
-#include <sys/wait.h>  
-#include <time.h>    
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdbool.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <math.h>
 #include <ctype.h>
 #include <limits.h>
-#include <sys/un.h> 
+#include <sys/un.h>
 
 #define MAX_COMMAND_SIZE 256
 #define BUFFER_SIZE 1024
@@ -139,7 +139,7 @@ char fpsCommandTemplate[150], powerCommandTemplate[100], qpDeltaCommandTemplate[
 bool verbose_mode = false;
 bool selection_busy = false;
 bool initialized_by_first_message = false;
-int message_count = 0; 
+int message_count = 0;
 bool paused = false;
 bool time_synced = false;
 int last_value_sent = 100;
@@ -149,7 +149,7 @@ pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t pause_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define MAX_CODES 5       // Maximum unique idr rq to track
-#define CODE_LENGTH 8 
+#define CODE_LENGTH 8
 #define EXPIRY_TIME_MS 1000
 
 int total_keyframe_requests = 0;
@@ -266,7 +266,7 @@ void load_tx_power_table(void) {
         for (; idx < POWER_LEVELS; idx++) {
             tx_power_table[mcs][idx] = last_value;
         }
-        
+
     }
 }
 
@@ -462,7 +462,7 @@ long get_monotonic_time() {
 
 int get_camera_bin() {
     char sensor_config[256];
-    
+
     // Run the system command to get the sensor config file path
     FILE *fp = popen("cli -g .isp.sensorConfig", "r");
     if (fp == NULL) {
@@ -605,7 +605,7 @@ void load_config(const char* filename) {
                 smoothing_factor_down = atof(value);
             } else if (strcmp(key, "roi_focus_mode") == 0) {
                 roi_focus_mode = atoi(value);
-            
+
             } else if (strcmp(key, "allow_spike_fix_fps") == 0) {
                 limitFPS = atoi(value);
 			
@@ -613,7 +613,7 @@ void load_config(const char* filename) {
                 allow_xtx_reduce_bitrate = atoi(value);
 			} else if (strcmp(key, "xtx_reduce_bitrate_factor") == 0) {
                 xtx_reduce_bitrate_factor = atof(value);
-			         
+			
             } else if (strcmp(key, "osd_level") == 0) {
                 osd_level = atoi(value);
             } else if (strcmp(key, "multiply_font_size_by") == 0) {
@@ -661,7 +661,7 @@ void load_config(const char* filename) {
 
 void trim_whitespace(char *str) {
     char *end;
-    
+
     // Trim leading spaces
     while (isspace((unsigned char)*str)) str++;
 
@@ -670,7 +670,7 @@ void trim_whitespace(char *str) {
     // Trim trailing spaces
     end = str + strlen(str) - 1;
     while (end > str && isspace((unsigned char)*end)) end--;
-    
+
     // Null-terminate the trimmed string
     *(end + 1) = '\0';
 }
@@ -758,10 +758,10 @@ int check_module_loaded(const char *module_name) {
 void load_from_vtx_info_yaml() {
     char command1[] = "yaml-cli-multi -i /etc/wfb.yaml -g .broadcast.ldpc";
     char command2[] = "yaml-cli-multi -i /etc/wfb.yaml -g .broadcast.stbc";
-    
+
     char buffer[128]; // Buffer to store command output
     FILE *pipe;
-    
+
     // Retrieve ldpc_tx value
     pipe = popen(command1, "r");
     if (pipe == NULL) {
@@ -823,7 +823,7 @@ int get_video_fps() {
 
 // Function to setup roi in majestic.yaml based on resolution
 int setup_roi() {
-    
+
     FILE *fp;  // Declare the FILE pointer before using it
 
 	
@@ -876,7 +876,7 @@ int setup_roi() {
 
     if (fgets(enabled_status, sizeof(enabled_status) - 1, fp) == NULL) {
 		printf("fgets failed\n");
-	} 
+	}
 
     // Trim newline character
     enabled_status[strcspn(enabled_status, "\n")] = 0;
@@ -921,7 +921,7 @@ int setup_roi() {
 void read_wfb_tx_cmd_output(int *k, int *n, int *stbc, int *ldpc, int *short_gi, int *actual_bandwidth, int *mcs_index, int *vht_mode, int *vht_nss) {
     char buffer[256];
     FILE *fp;
-    
+
     // Run first command
     fp = popen("wfb_tx_cmd 8000 get_fec", "r");
     if (fp == NULL) {
@@ -933,7 +933,7 @@ void read_wfb_tx_cmd_output(int *k, int *n, int *stbc, int *ldpc, int *short_gi,
         if (sscanf(buffer, "n=%d", n) == 1) continue;
     }
     pclose(fp);
-    
+
     // Run second command
     fp = popen("wfb_tx_cmd 8000 get_radio", "r");
     if (fp == NULL) {
@@ -1037,10 +1037,10 @@ void manage_fec_and_bitrate(int new_fec_k, int new_fec_n, int new_bitrate) {
 			(fec_k_adjust) ? (new_fec_k /= denominator) : (new_fec_n *= denominator);
 		}
     }
-    
+
     // Update the global FEC OSD regardless of order.
     snprintf(global_profile_fec_osd, sizeof(global_profile_fec_osd), "%d/%d", new_fec_k, new_fec_n);
-    
+
     // If increasing bitrate, change FEC first; otherwise, bitrate first.
     if (new_bitrate > old_bitrate) {
         // Format fecCommand
@@ -1053,7 +1053,7 @@ void manage_fec_and_bitrate(int new_fec_k, int new_fec_n, int new_bitrate) {
         execute_command(fecCommand);
         old_fec_k = new_fec_k;
         old_fec_n = new_fec_n;
-        
+
         // Format bitrateCommand
         const char *brKeys[] = { "bitrate" };
         char strBitrate[12];
@@ -1071,7 +1071,7 @@ void manage_fec_and_bitrate(int new_fec_k, int new_fec_n, int new_bitrate) {
         format_command(bitrateCommand, sizeof(bitrateCommand), bitrateCommandTemplate, 1, brKeys, brValues);
         execute_command(bitrateCommand);
         old_bitrate = new_bitrate;
-        
+
         // Then format fecCommand
         const char *fecKeys[] = { "fecK", "fecN" };
         char strFecK[10], strFecN[10];
@@ -1126,7 +1126,7 @@ void apply_profile(Profile* profile) {
         currentFPS = 60;
         currentDivideFpsBy = round((double)global_fps / 60);
     }
-    
+
     // --- qpDeltaCommand ---
     {
         const char *keys[] = { "qpDelta" };
@@ -1186,7 +1186,7 @@ void apply_profile(Profile* profile) {
         const char *values[] = { currentROIqp };
         format_command(roiCommand, sizeof(roiCommand), roiCommandTemplate, 1, keys, values);
     }
-    
+
     // --- Execution Logic ---
 	// If we're changing profile upwards, do this order
 	
@@ -1217,7 +1217,7 @@ void apply_profile(Profile* profile) {
         }
         		
         if (currentSetFecK != prevSetFecK || currentSetFecN != prevSetFecN || currentSetBitrate != prevSetBitrate) {
-           
+
 		    manage_fec_and_bitrate(currentSetFecK, currentSetFecN, currentSetBitrate);
 
             prevSetBitrate = currentSetBitrate;
@@ -1242,9 +1242,9 @@ void apply_profile(Profile* profile) {
             execute_command(fpsCommand);
             prevFPS = currentFPS;
         }
-        
+
 		if (currentSetFecK != prevSetFecK || currentSetFecN != prevSetFecN || currentSetBitrate != prevSetBitrate) {
-           
+
 		    manage_fec_and_bitrate(currentSetFecK, currentSetFecN, currentSetBitrate);
 
             prevSetBitrate = currentSetBitrate;
@@ -1284,10 +1284,10 @@ void apply_profile(Profile* profile) {
     const char *gi_string = short_gi ? "short" : "long";
     int pwr = allow_set_power ? finalPower : 0;
 	
-	// Construct profile_OSD string 
-    sprintf(global_profile_osd, "%lds %d %d%s%d Pw(%d)%d g%.1f", 
-            timeElapsed, 
-            profile->setBitrate, 
+	// Construct profile_OSD string
+    sprintf(global_profile_osd, "%lds %d %d%s%d Pw(%d)%d g%.1f",
+            timeElapsed,
+            profile->setBitrate,
             actual_bandwidth,
             gi_string,
             mcs_index,
@@ -1345,7 +1345,7 @@ void *periodic_update_osd(void *arg) {
 		
 	//get wfb channel for OSD
 	int wfb_ch = get_wlan0_channel();
-     
+
     // Generate extra stats string
     snprintf(global_extra_stats_osd, sizeof(global_extra_stats_osd),
          "pnlt%d xtx%ld(%d)%s gs_idr%d [ch%d]",
@@ -1356,7 +1356,7 @@ void *periodic_update_osd(void *arg) {
          total_keyframe_requests,
          wfb_ch);
 
-    
+
     // Append the persistent VTX antenna warning if detected
     if (weak_antenna_detected) {
         strncat(global_extra_stats_osd,
@@ -1635,14 +1635,14 @@ void special_command_message(const char *msg) {
     if (allow_request_keyframe && prevSetGop > 0.5 && strcmp(cleaned_msg, "request_keyframe") == 0 && code[0] != '\0') {
         struct timespec current_time;
         clock_gettime(CLOCK_MONOTONIC, &current_time);
-        
+
         // Clean up expired codes before proceeding
         cleanup_expired_codes(&current_time);
 
         // Check if the keyframe request interval has elapsed
         long elapsed_ms = (current_time.tv_sec - last_keyframe_request_time.tv_sec) * 1000 +
                           (current_time.tv_nsec - last_keyframe_request_time.tv_nsec) / 1000000;
-        
+
         if (elapsed_ms >= request_keyframe_interval_ms) {
             if (!code_exists(code, &current_time)) {
                 add_code(code, &current_time);  // Store new code and timestamp
@@ -1753,9 +1753,9 @@ void *periodic_tx_dropped(void *arg) {
             last_xtx_time = now;
         }
 
-        
+
         // 2) If we've reduced, but no new tx-drops for >= restore_interval_ms, restore to the previous “normal” bitrate once.
-        
+
         else if (bitrate_reduced && since_xtx_ms >= restore_interval_ms) {
             manage_fec_and_bitrate(prevSetFecK,
                                    prevSetFecN,
@@ -1810,7 +1810,7 @@ void *count_messages(void *arg) {
 }
 
 void process_message(const char *msg) {
-    
+
 	static struct timeval last_fec_call_time = {0};
     static int first_time = 1;
 
@@ -1915,10 +1915,10 @@ void process_message(const char *msg) {
 
     // Create OSD string with ground station stats information
 	if (num_antennas_drone > 0) {
-		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d lost%d ants:vrx%d,vtx%d", 
+		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d lost%d ants:vrx%d,vtx%d",
                                       rssi1, snr1, recovered, lost_packets, num_antennas, num_antennas_drone);
 	} else {
-		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d lost%d ants:vrx%d", 
+		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d lost%d ants:vrx%d",
                                       rssi1, snr1, recovered, lost_packets, num_antennas);
 	}
 
