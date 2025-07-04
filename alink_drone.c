@@ -1,19 +1,19 @@
-#include <stdio.h>  
-#include <stdlib.h>  
-#include <string.h>  
-#include <unistd.h>   
-#include <pthread.h>   
-#include <sys/socket.h>  
-#include <netinet/in.h>  
-#include <arpa/inet.h>  
-#include <stdbool.h>    
-#include <sys/time.h>  
-#include <sys/wait.h>  
-#include <time.h>    
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdbool.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <math.h>
 #include <ctype.h>
 #include <limits.h>
-#include <sys/un.h> 
+#include <sys/un.h>
 
 #define MAX_COMMAND_SIZE 256
 #define BUFFER_SIZE 1024
@@ -139,18 +139,19 @@ char fpsCommandTemplate[150], powerCommandTemplate[100], qpDeltaCommandTemplate[
 bool verbose_mode = false;
 bool selection_busy = false;
 bool initialized_by_first_message = false;
-int message_count = 0; 
+int message_count = 0;
 bool paused = false;
 bool time_synced = false;
 int last_value_sent = 100;
 struct timespec last_exec_time;
-struct timespec last_keyframe_request_time;
-pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t pause_mutex = PTHREAD_MUTEX_INITIALIZER;
+struct timespec last_keyframe_request_time;	// Last keyframe request command
+pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;  // Mutex for message count
+pthread_mutex_t pause_mutex = PTHREAD_MUTEX_INITIALIZER;  // Mutex for pause state
+pthread_mutex_t keyframe_mutex = PTHREAD_MUTEX_INITIALIZER;  // Mutex for keyframe request array
 
-#define MAX_CODES 5       // Maximum unique idr rq to track
-#define CODE_LENGTH 8 
-#define EXPIRY_TIME_MS 1000
+#define MAX_CODES 5       // Maximum number of unique keyframe requests to track
+#define CODE_LENGTH 8     // Max length of each unique code
+#define EXPIRY_TIME_MS 1000 // Code expiry time in milliseconds
 
 int total_keyframe_requests = 0;
 int total_keyframe_requests_xtx = 0;
@@ -266,7 +267,7 @@ void load_tx_power_table(void) {
         for (; idx < POWER_LEVELS; idx++) {
             tx_power_table[mcs][idx] = last_value;
         }
-        
+
     }
 }
 
@@ -460,9 +461,48 @@ long get_monotonic_time() {
     return ts.tv_sec;
 }
 
+// Safer time calculation to avoid overflow and handle negative time
+static long calculate_elapsed_time_ms(const struct timespec *current, const struct timespec *past) {
+    long long sec_diff = (long long)current->tv_sec - past->tv_sec;
+    long long nsec_diff = (long long)current->tv_nsec - past->tv_nsec;
+
+    // Check for overflow in seconds conversion
+    if (sec_diff > LONG_MAX / 1000) {
+        return LONG_MAX; // Return max value if overflow would occur
+    }
+
+    long long elapsed_ms = sec_diff * 1000 + nsec_diff / 1000000;
+
+    // Handle negative time (clock went backwards)
+    if (elapsed_ms < 0) {
+        return 0;
+    }
+
+    return (elapsed_ms > LONG_MAX) ? LONG_MAX : (long)elapsed_ms;
+}
+
+// Safer time calculation for timeval structures to avoid overflow and handle negative time
+static long calculate_elapsed_time_ms_timeval(const struct timeval *current, const struct timeval *past) {
+    long long sec_diff = (long long)current->tv_sec - past->tv_sec;
+    long long usec_diff = (long long)current->tv_usec - past->tv_usec;
+
+    // Check for overflow in seconds conversion
+    if (sec_diff > LONG_MAX / 1000) {
+        return LONG_MAX; // Return max value if overflow would occur
+    }
+
+    long long elapsed_ms = sec_diff * 1000 + usec_diff / 1000;
+
+    // Handle negative time (clock went backwards)
+    if (elapsed_ms < 0) {
+        return 0;
+    }
+
+    return (elapsed_ms > LONG_MAX) ? LONG_MAX : (long)elapsed_ms;
+}
 int get_camera_bin() {
     char sensor_config[256];
-    
+
     // Run the system command to get the sensor config file path
     FILE *fp = popen("cli -g .isp.sensorConfig", "r");
     if (fp == NULL) {
@@ -605,7 +645,7 @@ void load_config(const char* filename) {
                 smoothing_factor_down = atof(value);
             } else if (strcmp(key, "roi_focus_mode") == 0) {
                 roi_focus_mode = atoi(value);
-            
+
             } else if (strcmp(key, "allow_spike_fix_fps") == 0) {
                 limitFPS = atoi(value);
 			
@@ -613,7 +653,7 @@ void load_config(const char* filename) {
                 allow_xtx_reduce_bitrate = atoi(value);
 			} else if (strcmp(key, "xtx_reduce_bitrate_factor") == 0) {
                 xtx_reduce_bitrate_factor = atof(value);
-			         
+			
             } else if (strcmp(key, "osd_level") == 0) {
                 osd_level = atoi(value);
             } else if (strcmp(key, "multiply_font_size_by") == 0) {
@@ -661,7 +701,7 @@ void load_config(const char* filename) {
 
 void trim_whitespace(char *str) {
     char *end;
-    
+
     // Trim leading spaces
     while (isspace((unsigned char)*str)) str++;
 
@@ -670,7 +710,7 @@ void trim_whitespace(char *str) {
     // Trim trailing spaces
     end = str + strlen(str) - 1;
     while (end > str && isspace((unsigned char)*end)) end--;
-    
+
     // Null-terminate the trimmed string
     *(end + 1) = '\0';
 }
@@ -758,10 +798,10 @@ int check_module_loaded(const char *module_name) {
 void load_from_vtx_info_yaml() {
     char command1[] = "yaml-cli-multi -i /etc/wfb.yaml -g .broadcast.ldpc";
     char command2[] = "yaml-cli-multi -i /etc/wfb.yaml -g .broadcast.stbc";
-    
+
     char buffer[128]; // Buffer to store command output
     FILE *pipe;
-    
+
     // Retrieve ldpc_tx value
     pipe = popen(command1, "r");
     if (pipe == NULL) {
@@ -823,7 +863,7 @@ int get_video_fps() {
 
 // Function to setup roi in majestic.yaml based on resolution
 int setup_roi() {
-    
+
     FILE *fp;  // Declare the FILE pointer before using it
 
 	
@@ -876,7 +916,7 @@ int setup_roi() {
 
     if (fgets(enabled_status, sizeof(enabled_status) - 1, fp) == NULL) {
 		printf("fgets failed\n");
-	} 
+	}
 
     // Trim newline character
     enabled_status[strcspn(enabled_status, "\n")] = 0;
@@ -921,7 +961,7 @@ int setup_roi() {
 void read_wfb_tx_cmd_output(int *k, int *n, int *stbc, int *ldpc, int *short_gi, int *actual_bandwidth, int *mcs_index, int *vht_mode, int *vht_nss) {
     char buffer[256];
     FILE *fp;
-    
+
     // Run first command
     fp = popen("wfb_tx_cmd 8000 get_fec", "r");
     if (fp == NULL) {
@@ -933,7 +973,7 @@ void read_wfb_tx_cmd_output(int *k, int *n, int *stbc, int *ldpc, int *short_gi,
         if (sscanf(buffer, "n=%d", n) == 1) continue;
     }
     pclose(fp);
-    
+
     // Run second command
     fp = popen("wfb_tx_cmd 8000 get_radio", "r");
     if (fp == NULL) {
@@ -1037,10 +1077,10 @@ void manage_fec_and_bitrate(int new_fec_k, int new_fec_n, int new_bitrate) {
 			(fec_k_adjust) ? (new_fec_k /= denominator) : (new_fec_n *= denominator);
 		}
     }
-    
+
     // Update the global FEC OSD regardless of order.
     snprintf(global_profile_fec_osd, sizeof(global_profile_fec_osd), "%d/%d", new_fec_k, new_fec_n);
-    
+
     // If increasing bitrate, change FEC first; otherwise, bitrate first.
     if (new_bitrate > old_bitrate) {
         // Format fecCommand
@@ -1053,7 +1093,7 @@ void manage_fec_and_bitrate(int new_fec_k, int new_fec_n, int new_bitrate) {
         execute_command(fecCommand);
         old_fec_k = new_fec_k;
         old_fec_n = new_fec_n;
-        
+
         // Format bitrateCommand
         const char *brKeys[] = { "bitrate" };
         char strBitrate[12];
@@ -1071,7 +1111,7 @@ void manage_fec_and_bitrate(int new_fec_k, int new_fec_n, int new_bitrate) {
         format_command(bitrateCommand, sizeof(bitrateCommand), bitrateCommandTemplate, 1, brKeys, brValues);
         execute_command(bitrateCommand);
         old_bitrate = new_bitrate;
-        
+
         // Then format fecCommand
         const char *fecKeys[] = { "fecK", "fecN" };
         char strFecK[10], strFecN[10];
@@ -1126,7 +1166,7 @@ void apply_profile(Profile* profile) {
         currentFPS = 60;
         currentDivideFpsBy = round((double)global_fps / 60);
     }
-    
+
     // --- qpDeltaCommand ---
     {
         const char *keys[] = { "qpDelta" };
@@ -1186,7 +1226,7 @@ void apply_profile(Profile* profile) {
         const char *values[] = { currentROIqp };
         format_command(roiCommand, sizeof(roiCommand), roiCommandTemplate, 1, keys, values);
     }
-    
+
     // --- Execution Logic ---
 	// If we're changing profile upwards, do this order
 	
@@ -1217,7 +1257,7 @@ void apply_profile(Profile* profile) {
         }
         		
         if (currentSetFecK != prevSetFecK || currentSetFecN != prevSetFecN || currentSetBitrate != prevSetBitrate) {
-           
+
 		    manage_fec_and_bitrate(currentSetFecK, currentSetFecN, currentSetBitrate);
 
             prevSetBitrate = currentSetBitrate;
@@ -1242,9 +1282,9 @@ void apply_profile(Profile* profile) {
             execute_command(fpsCommand);
             prevFPS = currentFPS;
         }
-        
+
 		if (currentSetFecK != prevSetFecK || currentSetFecN != prevSetFecN || currentSetBitrate != prevSetBitrate) {
-           
+
 		    manage_fec_and_bitrate(currentSetFecK, currentSetFecN, currentSetBitrate);
 
             prevSetBitrate = currentSetBitrate;
@@ -1284,10 +1324,10 @@ void apply_profile(Profile* profile) {
     const char *gi_string = short_gi ? "short" : "long";
     int pwr = allow_set_power ? finalPower : 0;
 	
-	// Construct profile_OSD string 
-    sprintf(global_profile_osd, "%lds %d %d%s%d Pw(%d)%d g%.1f", 
-            timeElapsed, 
-            profile->setBitrate, 
+	// Construct profile_OSD string
+    sprintf(global_profile_osd, "%lds %d %d%s%d Pw(%d)%d g%.1f",
+            timeElapsed,
+            profile->setBitrate,
             actual_bandwidth,
             gi_string,
             mcs_index,
@@ -1345,7 +1385,7 @@ void *periodic_update_osd(void *arg) {
 		
 	//get wfb channel for OSD
 	int wfb_ch = get_wlan0_channel();
-     
+
     // Generate extra stats string
     snprintf(global_extra_stats_osd, sizeof(global_extra_stats_osd),
          "pnlt%d xtx%ld(%d)%s gs_idr%d [ch%d]",
@@ -1356,7 +1396,7 @@ void *periodic_update_osd(void *arg) {
          total_keyframe_requests,
          wfb_ch);
 
-    
+
     // Append the persistent VTX antenna warning if detected
     if (weak_antenna_detected) {
         strncat(global_extra_stats_osd,
@@ -1536,7 +1576,7 @@ void start_selection(int rssi_score, int snr_score, int recovered) {
 	sprintf(global_score_related_osd, "linkQ %d, smthdQ %d", osd_raw_score, osd_smoothed_score);
 
 	// Check if enough time has passed
-    long time_diff_ms = (current_time.tv_sec - last_exec_time.tv_sec) * 1000 + (current_time.tv_nsec - last_exec_time.tv_nsec) / 1000000;
+    long time_diff_ms = calculate_elapsed_time_ms(&current_time, &last_exec_time);
     if (time_diff_ms < min_between_changes_ms) {
         printf("Skipping profile load: time_diff_ms=%ldms - too soon (min %dms required)\n", time_diff_ms, min_between_changes_ms);
         selection_busy = false;
@@ -1570,12 +1610,13 @@ void start_selection(int rssi_score, int snr_score, int recovered) {
 
 // request_keyframe function to check if a code exists in the array and has not expired
 bool code_exists(const char *code, struct timespec *current_time) {
+    pthread_mutex_lock(&keyframe_mutex);
     for (int i = 0; i < num_keyframe_requests; i++) {
         if (strcmp(keyframe_request_codes[i].code, code) == 0) {
-            // Check if the request is still valid
-            long elapsed_time_ms = (current_time->tv_sec - keyframe_request_codes[i].timestamp.tv_sec) * 1000 +
-                                   (current_time->tv_nsec - keyframe_request_codes[i].timestamp.tv_nsec) / 1000000;
+            // Check if the request is still valid using safer time calculation
+            long elapsed_time_ms = calculate_elapsed_time_ms(current_time, &keyframe_request_codes[i].timestamp);
             if (elapsed_time_ms < EXPIRY_TIME_MS) {
+                pthread_mutex_unlock(&keyframe_mutex);
                 return true;  // Code exists and has not expired
             } else {
                 // Expired: Remove it by shifting the rest down
@@ -1583,15 +1624,18 @@ bool code_exists(const char *code, struct timespec *current_time) {
                         (num_keyframe_requests - i - 1) * sizeof(KeyframeRequest));
                 num_keyframe_requests--;
 				i--;  // Adjust index to re-check at this position after shift
+                pthread_mutex_unlock(&keyframe_mutex);
                 return false;  // Code expired
             }
         }
     }
+    pthread_mutex_unlock(&keyframe_mutex);
     return false;  // Code not found
 }
 
 // Function to add a code to the array
 void add_code(const char *code, struct timespec *current_time) {
+    pthread_mutex_lock(&keyframe_mutex);
     if (num_keyframe_requests < MAX_CODES) {
         strncpy(keyframe_request_codes[num_keyframe_requests].code, code, CODE_LENGTH);
         keyframe_request_codes[num_keyframe_requests].timestamp = *current_time;
@@ -1599,23 +1643,49 @@ void add_code(const char *code, struct timespec *current_time) {
     } else {
         printf("Max keyframe request codes reached. Consider increasing MAX_CODES.\n");
     }
+    pthread_mutex_unlock(&keyframe_mutex);
 }
 
 void cleanup_expired_codes(struct timespec *current_time) {
-    for (int i = 0; i < num_keyframe_requests; ) {
-        // Calculate elapsed time in milliseconds
-        long elapsed_time_ms = (current_time->tv_sec - keyframe_request_codes[i].timestamp.tv_sec) * 1000 +
-                               (current_time->tv_nsec - keyframe_request_codes[i].timestamp.tv_nsec) / 1000000;
+    pthread_mutex_lock(&keyframe_mutex);
 
-        // Remove the expired entry if elapsed time exceeds expiry threshold
+    if (num_keyframe_requests <= 0) {
+        pthread_mutex_unlock(&keyframe_mutex);
+        return;
+    }
+
+    // Find the most recent entry using calculate_elapsed_time_ms (smallest elapsed time)
+    int most_recent_idx = 0;
+    long min_elapsed = calculate_elapsed_time_ms(current_time, &keyframe_request_codes[0].timestamp);
+    for (int i = 1; i < num_keyframe_requests; i++) {
+        long elapsed = calculate_elapsed_time_ms(current_time, &keyframe_request_codes[i].timestamp);
+        if (elapsed < min_elapsed) {
+            min_elapsed = elapsed;
+            most_recent_idx = i;
+        }
+    }
+
+    // Remove expired codes except the most recent
+    for (int i = 0; i < num_keyframe_requests; ) {
+        if (i == most_recent_idx) {
+            i++;
+            continue;
+        }
+        long elapsed_time_ms = calculate_elapsed_time_ms(current_time, &keyframe_request_codes[i].timestamp);
+        printf("Keyframe request code: %s, Elapsed time: %ld ms\n", keyframe_request_codes[i].code, elapsed_time_ms);
         if (elapsed_time_ms >= EXPIRY_TIME_MS) {
             memmove(&keyframe_request_codes[i], &keyframe_request_codes[i + 1],
                     (num_keyframe_requests - i - 1) * sizeof(KeyframeRequest));
-            num_keyframe_requests--;  // Decrease the count of requests
+            num_keyframe_requests--;
+            // If we removed an entry before the most recent one, adjust its index
+            if (i < most_recent_idx) {
+                most_recent_idx--;
+            }
         } else {
-            i++;  // Only move to the next entry if no removal
+            i++;
         }
     }
+    pthread_mutex_unlock(&keyframe_mutex);
 }
 
 // Main function to handle special commands
@@ -1635,14 +1705,13 @@ void special_command_message(const char *msg) {
     if (allow_request_keyframe && prevSetGop > 0.5 && strcmp(cleaned_msg, "request_keyframe") == 0 && code[0] != '\0') {
         struct timespec current_time;
         clock_gettime(CLOCK_MONOTONIC, &current_time);
-        
+
         // Clean up expired codes before proceeding
         cleanup_expired_codes(&current_time);
 
-        // Check if the keyframe request interval has elapsed
-        long elapsed_ms = (current_time.tv_sec - last_keyframe_request_time.tv_sec) * 1000 +
-                          (current_time.tv_nsec - last_keyframe_request_time.tv_nsec) / 1000000;
-        
+        // Check if the keyframe request interval has elapsed using safer time calculation
+        long elapsed_ms = calculate_elapsed_time_ms(&current_time, &last_keyframe_request_time);
+
         if (elapsed_ms >= request_keyframe_interval_ms) {
             if (!code_exists(code, &current_time)) {
                 add_code(code, &current_time);  // Store new code and timestamp
@@ -1658,13 +1727,14 @@ void special_command_message(const char *msg) {
 				total_keyframe_requests++;
             } else {
                 if (verbose_mode) {
-					printf("Already requested keyframe for code: %s\n", code);
-				}
-			}
+                    printf("Already requested keyframe for code: %s\n", code);
+                }
+            }
         } else {
                 if (verbose_mode) {
-					printf("Keyframe request ignored. Interval not met for code: %s\n", code);
-				}
+
+                    printf("Keyframe request ignored. Interval  %ld not met for code: %s\n", elapsed_ms, code);
+                }
         }
 
     } else if (strcmp(cleaned_msg, "pause_adaptive") == 0) {
@@ -1725,8 +1795,7 @@ void *periodic_tx_dropped(void *arg) {
         clock_gettime(CLOCK_MONOTONIC, &now);
 
         // compute ms since last_xtx_time
-        long since_xtx_ms = (now.tv_sec  - last_xtx_time.tv_sec)  * 1000 +
-                             (now.tv_nsec - last_xtx_time.tv_nsec) / 1000000;
+        long since_xtx_ms = calculate_elapsed_time_ms(&now, &last_xtx_time);
 
         // disable roi to help mitigate spikes (until next profile change)
 		if (roi_focus_mode && latest_tx_dropped > 0 && strcmp(prevROIqp, "0,0,0,0") != 0) {
@@ -1752,9 +1821,9 @@ void *periodic_tx_dropped(void *arg) {
             last_xtx_time = now;
         }
 
-        
+
         // 2) If we've reduced, but no new tx-drops for >= restore_interval_ms, restore to the previous “normal” bitrate once.
-        
+
         else if (bitrate_reduced && since_xtx_ms >= restore_interval_ms) {
             manage_fec_and_bitrate(prevSetFecK,
                                    prevSetFecN,
@@ -1765,8 +1834,7 @@ void *periodic_tx_dropped(void *arg) {
                        since_xtx_ms);
         }
 
-        long elapsed_kf_ms = (now.tv_sec  - last_keyframe_request_time.tv_sec)  * 1000 +
-                             (now.tv_nsec - last_keyframe_request_time.tv_nsec) / 1000000;
+        long elapsed_kf_ms = calculate_elapsed_time_ms(&now, &last_keyframe_request_time);
 
         if (latest_tx_dropped > 0 && elapsed_kf_ms >= request_keyframe_interval_ms && allow_rq_kf_by_tx_d && prevSetGop > 0.5){
             char quotedCommand[BUFFER_SIZE];
@@ -1809,7 +1877,7 @@ void *count_messages(void *arg) {
 }
 
 void process_message(const char *msg) {
-    
+
 	static struct timeval last_fec_call_time = {0};
     static int first_time = 1;
 
@@ -1900,9 +1968,8 @@ void process_message(const char *msg) {
         first_time = 0;
     }
 
-    // Calculate the time difference in milliseconds
-    long elapsed_ms = (current_time.tv_sec - last_fec_call_time.tv_sec) * 1000 +
-                      (current_time.tv_usec - last_fec_call_time.tv_usec) / 1000;
+    // Calculate the time difference in milliseconds using safer method
+    long elapsed_ms = calculate_elapsed_time_ms_timeval(&current_time, &last_fec_call_time);
 
     // Only call manage_fec_and_bitrate if a fec_change has occurred and
     // at least 1 second has elapsed since the last call
@@ -1914,10 +1981,10 @@ void process_message(const char *msg) {
 
     // Create OSD string with ground station stats information
 	if (num_antennas_drone > 0) {
-		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d lost%d ants:vrx%d,vtx%d", 
+		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d lost%d ants:vrx%d,vtx%d",
                                       rssi1, snr1, recovered, lost_packets, num_antennas, num_antennas_drone);
 	} else {
-		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d lost%d ants:vrx%d", 
+		sprintf(global_gs_stats_osd, "rssi%d snr%d fec%d lost%d ants:vrx%d",
                                       rssi1, snr1, recovered, lost_packets, num_antennas);
 	}
 
